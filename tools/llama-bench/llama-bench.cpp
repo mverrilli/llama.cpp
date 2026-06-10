@@ -496,6 +496,15 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    if (s == "kpc4_1") {
+        return GGML_TYPE_KPC4_1;
+    }
+    if (s == "q3v_1") {
+        return GGML_TYPE_Q3V_1;
+    }
+    if (s == "q3v_2") {
+        return GGML_TYPE_Q3V_2;
+    }
 
     return GGML_TYPE_COUNT;
 }
@@ -618,6 +627,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
+                    if (gt == GGML_TYPE_Q3V_1 || gt == GGML_TYPE_Q3V_2) {
+                        fprintf(stderr, "error: cache type '%s' is V-only, not valid for -ctk\n", t.c_str());
+                        invalid_param = true;
+                        break;
+                    }
                     types.push_back(gt);
                 }
                 if (invalid_param) {
@@ -635,6 +649,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & t : p) {
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
+                        invalid_param = true;
+                        break;
+                    }
+                    if (gt == GGML_TYPE_KPC4_1) {
+                        fprintf(stderr, "error: cache type '%s' is K-only, not valid for -ctv\n", t.c_str());
                         invalid_param = true;
                         break;
                     }

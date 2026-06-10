@@ -287,7 +287,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 // store indexer keys to KV cache
                 const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();
                 const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
-                ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
+                ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, nullptr, nullptr, il));
 
                 // prepare indexer weights
                 ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);

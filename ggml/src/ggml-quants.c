@@ -439,6 +439,127 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void quantize_row_q3v_1_ref(const float * GGML_RESTRICT x, block_q3v_1 * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK3V;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float min = FLT_MAX, max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        const float d  = (max - min) / 7.0f;     // 3-bit asymmetric: levels 0..7
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].m = GGML_FP32_TO_FP16(min);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+
+        for (int j = 0; j < qk; ++j) {
+            int q = (int)((x[i*qk + j] - min)*id + 0.5f);
+            if (q < 0) q = 0;
+            if (q > 7) q = 7;
+            const int bit = 3*j, byte = bit >> 3, off = bit & 7;   // pack 3-bit value at bit offset 3j
+            y[i].qs[byte] |= (uint8_t)(q << off);
+            if (off > 5) y[i].qs[byte + 1] |= (uint8_t)(q >> (8 - off));
+        }
+    }
+}
+
+void dequantize_row_q3v_1(const block_q3v_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK3V;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int j = 0; j < qk; ++j) {
+            const int bit = 3*j, byte = bit >> 3, off = bit & 7;
+            int q = x[i].qs[byte] >> off;
+            if (off > 5) q |= x[i].qs[byte + 1] << (8 - off);
+            q &= 7;
+            y[i*qk + j] = q*d + m;
+        }
+    }
+}
+
+void quantize_row_q3v_2_ref(const float * GGML_RESTRICT x, block_q3v_2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3V2 == 0);
+    const int nb = k / QK3V2;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + (int64_t)i*QK3V2;
+        float d[QK3V2_NSUB], m[QK3V2_NSUB];
+        float dmax = 0.0f, mmin = FLT_MAX, mmax = -FLT_MAX;
+        for (int s = 0; s < QK3V2_NSUB; s++) {
+            float mn = FLT_MAX, mx = -FLT_MAX;
+            for (int j = 0; j < QK3V; j++) { const float v = xb[s*QK3V + j]; if (v < mn) mn = v; if (v > mx) mx = v; }
+            d[s] = (mx - mn) / 7.0f;
+            m[s] = mn;
+            if (d[s] > dmax) dmax = d[s];
+            if (mn   < mmin) mmin = mn;
+            if (mn   > mmax) mmax = mn;
+        }
+        // int8 super-params (reconstructed identically in dequant)
+        y[i].super_d = GGML_FP32_TO_FP16(dmax > 0.0f ? dmax / 255.0f          : 0.0f);
+        y[i].m_min   = GGML_FP32_TO_FP16(mmin);
+        y[i].super_m = GGML_FP32_TO_FP16(mmax > mmin ? (mmax - mmin) / 255.0f : 0.0f);
+        const float sd = GGML_FP16_TO_FP32(y[i].super_d);
+        const float mm = GGML_FP16_TO_FP32(y[i].m_min);
+        const float sm = GGML_FP16_TO_FP32(y[i].super_m);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+
+        for (int s = 0; s < QK3V2_NSUB; s++) {
+            int qd = sd > 0.0f ? (int)lrintf(d[s] / sd)          : 0;
+            int qm = sm > 0.0f ? (int)lrintf((m[s] - mm) / sm)   : 0;
+            if (qd < 0) qd = 0; if (qd > 255) qd = 255;
+            if (qm < 0) qm = 0; if (qm > 255) qm = 255;
+            y[i].qd[s] = (uint8_t) qd;
+            y[i].qm[s] = (uint8_t) qm;
+            const float dpr = y[i].qd[s] * sd;            // effective d', m' (match dequant)
+            const float mpr = mm + y[i].qm[s] * sm;
+            const float id  = dpr ? 1.0f/dpr : 0.0f;
+            uint8_t * qsb = y[i].qs + s*(QK3V*3/8);
+            for (int j = 0; j < QK3V; ++j) {
+                int q = (int)((xb[s*QK3V + j] - mpr)*id + 0.5f);
+                if (q < 0) q = 0;
+                if (q > 7) q = 7;
+                const int bit = 3*j, byte = bit >> 3, off = bit & 7;
+                qsb[byte] |= (uint8_t)(q << off);
+                if (off > 5) qsb[byte + 1] |= (uint8_t)(q >> (8 - off));
+            }
+        }
+    }
+}
+
+void dequantize_row_q3v_2(const block_q3v_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3V2 == 0);
+    const int nb = k / QK3V2;
+
+    for (int i = 0; i < nb; i++) {
+        const float sd = GGML_FP16_TO_FP32(x[i].super_d);
+        const float mm = GGML_FP16_TO_FP32(x[i].m_min);
+        const float sm = GGML_FP16_TO_FP32(x[i].super_m);
+        for (int s = 0; s < QK3V2_NSUB; s++) {
+            const float d = x[i].qd[s] * sd;
+            const float m = mm + x[i].qm[s] * sm;
+            const uint8_t * qsb = x[i].qs + s*(QK3V*3/8);
+            float * yb = y + (int64_t)i*QK3V2 + s*QK3V;
+            for (int j = 0; j < QK3V; ++j) {
+                const int bit = 3*j, byte = bit >> 3, off = bit & 7;
+                int q = qsb[byte] >> off;
+                if (off > 5) q |= qsb[byte + 1] << (8 - off);
+                q &= 7;
+                yb[j] = q*d + m;
+            }
+        }
+    }
+}
+
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 

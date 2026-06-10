@@ -227,6 +227,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_KPC4_1] = {
+        .vec_dot_type             = GGML_TYPE_F32,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -246,6 +249,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+    },
+    [GGML_TYPE_Q3V_1] = {   // FA-only V cache: from_float (cpy_v) + to_float, no mul_mat dot
+        .from_float               = quantize_row_q3v_1,
+        .vec_dot_type             = GGML_TYPE_F32,
+    },
+    [GGML_TYPE_Q3V_2] = {   // int8-meta 3-bit V cache (blck=128): FA-only, same usage as q3v_1
+        .from_float               = quantize_row_q3v_2,
+        .vec_dot_type             = GGML_TYPE_F32,
     },
     [GGML_TYPE_Q5_0] = {
         .from_float               = quantize_row_q5_0,
@@ -2071,6 +2082,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_custom(params, tensor);
             }
             break;
+        case GGML_OP_KPC_DEQUANT:
+            {
+                ggml_compute_forward_kpc_dequant(params, tensor);
+            }
+            break;
+        case GGML_OP_KPC_FLASH_ATTN:
+            {
+                ggml_compute_forward_kpc_flash_attn(params, tensor);
+            }
+            break;
+        case GGML_OP_KPC_WRITE:
+            {
+                ggml_compute_forward_kpc_write(params, tensor);
+            }
+            break;
+        case GGML_OP_KPC_REQUANT:
+            {
+                ggml_compute_forward_kpc_requant(params, tensor);
+            }
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
@@ -2367,6 +2398,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_KPC_DEQUANT:
+        case GGML_OP_KPC_FLASH_ATTN:
+        case GGML_OP_KPC_WRITE:
+        case GGML_OP_KPC_REQUANT:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:

@@ -321,10 +321,17 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
+    ggml_tensor * get_kpc_seq() const { return self_kpc_seq; }
+    ggml_tensor * get_kpc_pos() const { return self_kpc_pos; }
+
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    // KPC int4 K-cache: per-token primary seq + true position, driving the (seq,group) pool assignment
+    ggml_tensor * self_kpc_seq = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kpc_pos = nullptr; // I32 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -434,6 +441,11 @@ public:
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
     ggml_tensor * get_v_idxs_swa() const { return self_v_idxs_swa; }
 
+    ggml_tensor * get_kpc_seq()     const { return self_kpc_seq; }
+    ggml_tensor * get_kpc_pos()     const { return self_kpc_pos; }
+    ggml_tensor * get_kpc_seq_swa() const { return self_kpc_seq_swa; }
+    ggml_tensor * get_kpc_pos_swa() const { return self_kpc_pos_swa; }
+
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
@@ -441,6 +453,12 @@ public:
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    // KPC int4 K-cache: per-token primary seq + true position (base and SWA sub-caches)
+    ggml_tensor * self_kpc_seq     = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kpc_pos     = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kpc_seq_swa = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kpc_pos_swa = nullptr; // I32 [n_batch]
 
     ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -968,7 +986,9 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * k_scalezp  = nullptr,   // KPC: per-channel scale/zp -> fused attn
+            ggml_tensor * k_groupidx = nullptr) const; // pool index
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

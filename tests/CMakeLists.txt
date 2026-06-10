@@ -242,6 +242,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-kpc.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -258,6 +259,49 @@ set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# kpc model tests build a head_dim=128 model via internal (non-LLAMA_API) functions; disable on Windows shared libs
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # KPC4_1 needs n_embd_head_k % 32 == 0; the downloadable tiny models (stories15M=48, stories260K=8) don't
+    # qualify, so generate a tiny head_dim=128 llama model and use it for the kpc model tests below.
+    set(KPC_MODEL "${CMAKE_BINARY_DIR}/kpc-test-model.gguf")
+    llama_build_and_test(test-kpc-gen-model.cpp LABEL "model" ARGS "${KPC_MODEL}")
+    set_tests_properties(test-kpc-gen-model PROPERTIES FIXTURES_SETUP kpc-model)
+
+    # Test KPC4_1 whole-state save/restore preserves per-sequence open-group staging (unified, multi-seq)
+    llama_build_and_test(test-kpc-state.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Test KPC4_1 PER-SEQUENCE state save/restore (Stage 1, all-DEQUANT): round-trip one seq -> q8_0-class logits
+    llama_build_and_test(test-kpc-state-seq.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state-seq PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Same round-trip with the Stage 2 RAW fast-path enabled (int4+scalezp verbatim, bit-exact on aligned restore)
+    add_test(NAME test-kpc-state-seq-raw COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state-seq-raw PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_SEQ_RAW=1")
+
+    # Edge-case configs that gate server adoption: non-unified streams and RAW combos
+    add_test(NAME test-kpc-state-seq-nonunified COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state-seq-nonunified PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_TEST_NONUNIFIED=1")
+    add_test(NAME test-kpc-state-seq-nonunified-raw COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state-seq-nonunified-raw PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_TEST_NONUNIFIED=1;KPC_SEQ_RAW=1")
+
+    # Test KPC4_1 context-shift (RoPE K-shift) on a NON-UNIFIED cache (n_stream>1): stream-aware dequant/requant
+    llama_build_and_test(test-kpc-nonunified-shift.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-nonunified-shift PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Test KPC4_1 staging lifecycle: seq_rm/seq_keep/clear retire or trim the open-group staging
+    llama_build_and_test(test-kpc-seq-reuse.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-seq-reuse PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Test KPC4_1 shift+continue against an independent reference (post-shift regrouping)
+    llama_build_and_test(test-kpc-shift-contract.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-shift-contract PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Test KPC4_1 under the ctx_other shared-cells path (server MTP/draft): no crash, target intact
+    llama_build_and_test(test-kpc-shared-cells.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-shared-cells PROPERTIES FIXTURES_REQUIRED kpc-model)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading

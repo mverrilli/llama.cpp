@@ -201,6 +201,28 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
 
+// 3-bit asymmetric (delta + min), bit-packed: value j at bits [3j, 3j+3) of qs
+#define QK3V 32
+typedef struct {
+    ggml_half d;            // delta
+    ggml_half m;            // min
+    uint8_t   qs[QK3V*3/8];
+} block_q3v_1;
+static_assert(sizeof(block_q3v_1) == 2 * sizeof(ggml_half) + QK3V*3/8, "wrong q3v_1 block size/padding");
+
+// q3v_1 with int8 double-quant metadata: 128-elem superblock of 4 q3v sub-blocks, d/m int8-quantized vs fp16 super-params
+#define QK3V2 128
+#define QK3V2_NSUB (QK3V2/QK3V) // 4 sub-blocks
+typedef struct {
+    ggml_half super_d;
+    ggml_half m_min;               // sub-block min base
+    ggml_half super_m;
+    uint8_t   qd[QK3V2_NSUB];      // int8 sub-block scales
+    uint8_t   qm[QK3V2_NSUB];      // int8 sub-block mins
+    uint8_t   qs[QK3V2*3/8];       // 3-bit quants
+} block_q3v_2;
+static_assert(sizeof(block_q3v_2) == 3 * sizeof(ggml_half) + 2*QK3V2_NSUB + QK3V2*3/8, "wrong q3v_2 block size/padding");
+
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e; // E8M0

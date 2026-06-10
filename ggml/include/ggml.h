@@ -429,7 +429,10 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_KPC4_1 = 45,
+        GGML_TYPE_Q3V_1  = 46, // 3-bit asymmetric V cache (sub-q4, paired with KPC4_1 K)
+        GGML_TYPE_Q3V_2  = 47, // 3-bit V cache, int8 superblock metadata (blck=128)
+        GGML_TYPE_COUNT      = 48,
     };
 
     // precision
@@ -583,6 +586,11 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_KPC_DEQUANT,
+        GGML_OP_KPC_FLASH_ATTN,
+        GGML_OP_KPC_WRITE,
+        GGML_OP_KPC_REQUANT,
 
         GGML_OP_COUNT,
     };
@@ -2415,6 +2423,58 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // KPC wire format, shared by the kernels, the llama KV cache and the tests:
+    // token group size and the int8 scalezp slab size per group
+    // (slab layout: [fp16 super_scale_s][fp16 zp_min][fp16 super_scale_z][C x u8 q_s][C x u8 q_z])
+#define GGML_KPC_GROUP        32
+#define GGML_KPC_SZ_GROUP_BYTES(C) (2*(int64_t)(C) + 6)
+
+    // group_index (optional, I32): per-slot scalezp pool index, NULL -> contiguous; -1 entries = free cells
+    GGML_API struct ggml_tensor * ggml_kpc_dequant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * scalezp,
+            struct ggml_tensor  * group_index);
+
+    // fused per-channel attention; kq_scale is folded into the kernel's per-channel Q prescale.
+    // supports ALiBi, logit softcap, sinks (like ggml_flash_attn_ext)
+    GGML_API struct ggml_tensor * ggml_kpc_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed_k,
+            struct ggml_tensor  * scalezp,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * group_index,
+            struct ggml_tensor  * sinks,
+            float                 kq_scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // in-place residual-staged per-channel int4 K write; scatter placement from k_idxs, groups by logical pos/32
+    // (kpc_seq/kpc_pos are per-token graph inputs driving the per-sequence (seq,group) pool assignment)
+    GGML_API struct ggml_tensor * ggml_kpc_write(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * scalezp,
+            struct ggml_tensor  * k_resid,
+            struct ggml_tensor  * group_index,
+            struct ggml_tensor  * k_resid_slots,
+            struct ggml_tensor  * staged_group,
+            struct ggml_tensor  * staged_mask,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * k_idxs,
+            struct ggml_tensor  * kpc_seq,
+            struct ggml_tensor  * kpc_pos);
+
+    // re-quantize roped f32 K back into the packed int4 cache + scalezp, keeping group_index (used by the KPC RoPE K-shift)
+    GGML_API struct ggml_tensor * ggml_kpc_requant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,            // packed int4 cache [krow, n_kv] (aliased / written in place)
+            struct ggml_tensor  * scalezp,      // f16 [2C, ng_max] (written in place)
+            struct ggml_tensor  * group_index,  // i32 [n_kv] (read: cell -> pool)
+            struct ggml_tensor  * roped);       // f32 [C, n_kv]
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

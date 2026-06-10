@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kpc.h"
 
 #include <algorithm>
 #include <cassert>
@@ -128,7 +129,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 6u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -147,6 +148,19 @@ llama_kv_cache::llama_kv_cache(
     };
 
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
+
+    if (type_k == GGML_TYPE_KPC4_1) {
+        // each of the n_seqps sequences sharing a stream needs at least one scalezp pool in its band
+        const uint32_t ng_max  = (kv_size + KPC_GROUP - 1) / KPC_GROUP;
+        const uint32_t n_seqps = n_seq_max / n_stream;
+        if (ng_max < n_seqps) {
+            const uint32_t kv_min = n_seqps * KPC_GROUP;
+            throw std::runtime_error(format(
+                "KPC4_1 K cache needs kv_size/%d >= n_seq_max/n_stream (%u pools < %u seqs per stream). "
+                "Raise the context size to >= %u, or %s", KPC_GROUP, ng_max, n_seqps, kv_min,
+                n_stream == 1 ? "drop --kv-unified (it pins n_seq_max to LLAMA_MAX_SEQ)" : "reduce n_parallel"));
+        }
+    }
 
     v_heads.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -248,6 +262,29 @@ llama_kv_cache::llama_kv_cache(
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
+        ggml_tensor * k_scalezp     = nullptr;
+        ggml_tensor * k_resid       = nullptr;
+        ggml_tensor * group_index   = nullptr;
+        ggml_tensor * k_resid_slots = nullptr;
+        ggml_tensor * staged_group  = nullptr;
+        ggml_tensor * staged_mask   = nullptr;
+        if (has_k && type_k == GGML_TYPE_KPC4_1) {
+            const int64_t ng_max = (kv_size + KPC_GROUP - 1) / KPC_GROUP;
+            // scalezp/group_index indexed per stream (ng_max pool banded per seq); staging sized by n_seq_max
+            k_scalezp = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(n_embd_k_gqa), ng_max, n_stream);
+            ggml_format_name(k_scalezp, "cache_k_scalezp_l%d", il);
+            k_resid = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, KPC_GROUP, n_seq_max);
+            ggml_format_name(k_resid, "cache_k_resid_l%d", il);
+            group_index = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv_size, n_stream);
+            ggml_format_name(group_index, "cache_k_gidx_l%d", il);
+            k_resid_slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, n_seq_max);
+            ggml_format_name(k_resid_slots, "cache_k_resid_slots_l%d", il);
+            staged_group = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq_max);
+            ggml_format_name(staged_group, "cache_k_staged_group_l%d", il);
+            staged_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq_max);
+            ggml_format_name(staged_mask, "cache_k_staged_mask_l%d", il);
+        }
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
@@ -258,7 +295,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k_scalezp, k_resid, group_index, k_resid_slots, staged_group, staged_mask });
     }
 
     if (reuse) {
@@ -303,8 +340,16 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+
+        // the host writes KPC side tensors directly (staging retirement, group_index maintenance)
+        if (type_k == GGML_TYPE_KPC4_1 && !ggml_backend_buffer_is_host(buf)) {
+            throw std::runtime_error("KPC4_1 K cache requires host (CPU) KV buffers; offloaded KV cache is not supported");
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
+
+    kpc_reset_state();   // group_index starts unmapped (-1)
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -334,6 +379,7 @@ llama_kv_cache::llama_kv_cache(
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
+            type_k != GGML_TYPE_KPC4_1 &&   // rotation breaks the per-channel layout
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning indexer
@@ -387,6 +433,8 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    kpc_reset_state();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -417,6 +465,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                kpc_free_cell(seq_to_stream[seq_id], i);
+
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -426,6 +476,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
+        }
+
+        // retire staging when the seq has no cells left, else drop the removed range's staged
+        // members, so a later write can't fold stale residuals
+        if (kpc_enabled()) {
+            if (cells.seq_pos_max(seq_id) < 0) {
+                kpc_retire_seq(seq_id);
+            } else {
+                kpc_trim_staging(seq_id, p0, p1);
+            }
         }
     } else {
         // match any sequence
@@ -441,6 +501,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+                kpc_free_cell(s, i);
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -452,9 +513,103 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+
+        if (kpc_enabled()) {
+            for (uint32_t sq = 0; sq < n_seq_max; ++sq) {
+                if (v_cells[seq_to_stream[sq]].seq_pos_max(sq) < 0) {
+                    kpc_retire_seq(sq);
+                } else {
+                    kpc_trim_staging(sq, p0, p1);
+                }
+            }
+        }
     }
 
     return true;
+}
+
+int32_t llama_kv_cache::kpc_staged_mask(uint32_t il, int32_t slot) const {
+    if (slot < 0) {
+        return 0;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return 0;
+    }
+    const auto & layer = layers[it->second];
+    return layer.staged_mask ? ((const int32_t *) layer.staged_mask->data)[slot] : 0;
+}
+
+int32_t llama_kv_cache::kpc_slot_of(llama_seq_id seq_id) const {
+    return (int32_t) seq_id;
+}
+
+void llama_kv_cache::kpc_clear_staging_slot(int32_t slot) const {
+    if (slot < 0) {
+        return;
+    }
+    for (const auto & layer : layers) {   // no-op for non-KPC layers (staged tensors are null)
+        if (layer.staged_mask)  ((int32_t *) layer.staged_mask->data)[slot]  = 0;
+        if (layer.staged_group) ((int32_t *) layer.staged_group->data)[slot] = 0;
+    }
+}
+
+void llama_kv_cache::kpc_retire_seq(llama_seq_id seq_id) const {
+    if (!kpc_enabled()) {
+        return;
+    }
+    kpc_clear_staging_slot(kpc_slot_of(seq_id));
+}
+
+void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!kpc_enabled()) {
+        return;
+    }
+    const int32_t slot = kpc_slot_of(seq_id);
+    if (slot < 0) {
+        return;
+    }
+    for (const auto & layer : layers) {
+        if (!layer.staged_mask) {
+            continue;
+        }
+        int32_t & mask = ((int32_t *) layer.staged_mask->data)[slot];
+        if (mask == 0) {
+            continue;
+        }
+        const int32_t grp = ((const int32_t *) layer.staged_group->data)[slot];
+        for (int w = 0; w < KPC_GROUP; ++w) {
+            const llama_pos pos = (llama_pos) grp*KPC_GROUP + w;
+            if ((mask & (1 << w)) && pos >= p0 && pos < p1) {
+                mask &= ~(1 << w);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::kpc_free_cell(uint32_t strm, uint32_t i) const {
+    if (!kpc_enabled()) {
+        return;
+    }
+    for (const auto & layer : layers) {
+        if (layer.group_index) {
+            ((int32_t *) layer.group_index->data)[(size_t) strm*layer.group_index->ne[0] + i] = -1;
+        }
+    }
+}
+
+void llama_kv_cache::kpc_reset_state() const {
+    if (!kpc_enabled()) {
+        return;
+    }
+    for (const auto & layer : layers) {
+        if (!layer.k_scalezp || !layer.group_index->data) {
+            continue;
+        }
+        memset(layer.group_index->data, 0xFF, ggml_nbytes(layer.group_index));   // -1: all cells unmapped
+        memset(layer.staged_mask->data,  0, ggml_nbytes(layer.staged_mask));
+        memset(layer.staged_group->data, 0, ggml_nbytes(layer.staged_group));
+    }
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -496,6 +651,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
                 cells.seq_add(i, seq_id_dst);
             }
         }
+
+        // retire dst's staging (it referred to its old content); the copied cells stay in src's
+        // pool band - a later re-encode of those pools rescues the shared cells, so sharing is safe
+        kpc_retire_seq(seq_id_dst);
 
         return;
     }
@@ -564,6 +723,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            kpc_free_cell(seq_to_stream[seq_id], i);
+
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -573,6 +734,15 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
+    }
+
+    // every other sequence is gone; retire their KPC staging so reused seq ids start clean
+    if (kpc_enabled()) {
+        for (uint32_t sq = 0; sq < n_seq_max; ++sq) {
+            if ((llama_seq_id) sq != seq_id) {
+                kpc_retire_seq(sq);
+            }
+        }
     }
 }
 
@@ -613,13 +783,17 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            if (cells.pos_add(i, shift)) {   // true -> the cell dropped out of range and was removed
+                kpc_free_cell(seq_to_stream[seq_id], i);
+
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
             }
         }
     }
+    // note: surviving cells were renumbered; the KPC group regroup happens in the K-shift pass
+    // (set_input_kpc_shift) that the resulting has_shift triggers on the next update
 
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
@@ -858,6 +1032,21 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
+                }
+
+                if (layer.k_scalezp) {  // KPC: copy scale/zp + residual + staging state
+                    auto copy_slab = [&](ggml_tensor * t) {
+                        const size_t slab = ggml_nbytes(t) / n_stream;   // last dim is n_stream for all KPC state
+                        std::vector<uint8_t> tmp(slab);
+                        ggml_backend_tensor_get(t, tmp.data(), ssrc*slab, slab);
+                        ggml_backend_tensor_set(t, tmp.data(), sdst*slab, slab);
+                    };
+                    copy_slab(layer.k_scalezp);
+                    copy_slab(layer.k_resid);
+                    copy_slab(layer.group_index);
+                    copy_slab(layer.k_resid_slots);
+                    copy_slab(layer.staged_group);
+                    copy_slab(layer.staged_mask);
                 }
             }
         }
@@ -1135,6 +1324,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
                 cells.rm(idx);
+                kpc_free_cell(sinfo.strm[s], idx);
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
@@ -1189,6 +1379,7 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    // KPC int4 K uses build_rope_shift's dedicated dequant -> rope -> kpc_requant path; no n_stream restriction
     return true;
 }
 
@@ -1248,12 +1439,44 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    if (k->type == GGML_TYPE_KPC4_1 && v_trans) {
+        // flash-attn off (v_trans set): dequant packed K -> F16 for the mul_mat path, one slab per stream
+        const int64_t C  = n_embd_k_gqa;
+        const int64_t ng_max = layers[ikv].k_scalezp->ne[1];   // full scalezp pool (group_index points into it)
+        ggml_tensor * sz_cache = layers[ikv].k_scalezp;
+        ggml_tensor * gi_cache = layers[ikv].group_index;
+        ggml_tensor * packed_v = ggml_view_3d(ctx, k, C, n_kv, ns, k->nb[1], k->nb[2], (int64_t)sinfo.s0*k->nb[2]);
+        ggml_tensor * sz_v     = ggml_view_3d(ctx, sz_cache, KPC_SZ_GROUP_BYTES(C), ng_max, ns, sz_cache->nb[1], sz_cache->nb[2], (int64_t)sinfo.s0*sz_cache->nb[2]);
+        ggml_tensor * gi_v     = ggml_view_2d(ctx, gi_cache, n_kv, ns, gi_cache->nb[1], (int64_t)sinfo.s0*gi_cache->nb[1]);
+        ggml_tensor * kf16     = ggml_kpc_dequant(ctx, packed_v, sz_v, gi_v);
+        return ggml_reshape_4d(ctx, kf16, hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns);
+    }
+
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_scalezp(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * k  = layers[ikv].k;
+    auto * sz = layers[ikv].k_scalezp;
+    const int64_t C  = k->ne[0];
+    // group_index holds absolute (per-seq banded) pool indices, so return the full ng_max pool, not an n_kv slice
+    GGML_UNUSED(n_kv);
+    const int64_t ng = sz->ne[1];
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_3d(ctx, sz, KPC_SZ_GROUP_BYTES(C), ng, ns, sz->nb[1], sz->nb[2], (int64_t)sinfo.s0*sz->nb[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_k_groupidx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * gi = layers[ikv].group_index;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_2d(ctx, gi, n_kv, ns, gi->nb[1], (int64_t)sinfo.s0*gi->nb[1]);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1288,7 +1511,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * kpc_seq, ggml_tensor * kpc_pos, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1308,6 +1531,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     const int64_t n_stream = k->ne[2];
+
+    if (k->type == GGML_TYPE_KPC4_1) {
+        // per-channel int4 K write: group by logical pos/32, requant full groups from f16 originals (k_resid);
+        // kpc_seq/kpc_pos select the (seq,group) scalezp pool; placement scatters via k_idxs (SWA/defrag)
+        GGML_ASSERT(kpc_seq && kpc_pos && "KPC write needs kpc_seq/kpc_pos inputs");
+        return ggml_kpc_write(ctx, k, layers[ikv].k_scalezp, layers[ikv].k_resid, layers[ikv].group_index,
+                                   layers[ikv].k_resid_slots, layers[ikv].staged_group, layers[ikv].staged_mask,
+                                   k_cur, k_idxs, kpc_seq, kpc_pos);
+    }
 
     if (n_stream > 1) {
         const int64_t kv_size = get_size();
@@ -1389,6 +1621,18 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     return k_idxs;
 }
 
+ggml_tensor * llama_kv_cache::build_input_kpc_seq(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(t);
+    return t;
+}
+
+ggml_tensor * llama_kv_cache::build_input_kpc_pos(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(t);
+    return t;
+}
+
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -1462,6 +1706,29 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     }
 }
 
+void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(seq->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+    int32_t * seq_data = (int32_t *) seq->data;
+    int32_t * pos_data = (int32_t *) pos->data;
+
+    // same token ordering as set_input_k_idxs (ti = s*size + i) so kpc_seq / kpc_pos / k_idxs index-align
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t i = 0; i < sinfo.size(); ++i) {
+            const uint32_t ti = s*sinfo.size() + i;
+            GGML_ASSERT(ubatch->n_seq_id[ti] >= 1);
+            const llama_seq_id sb = ubatch->seq_id[ti][0];   // primary seq for the (seq,group) pool
+            GGML_ASSERT(sb >= 0 && sb < (int) n_seq_max);
+
+            seq_data[ti] = sb;
+            pos_data[ti] = ubatch->pos[ti];
+        }
+    }
+}
+
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
@@ -1506,6 +1773,52 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
         for (uint32_t i = 0; i < cells.size(); ++i) {
             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
+    }
+}
+
+void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(gi_old->buffer));
+    GGML_ASSERT(kpc_enabled());
+
+    const uint32_t kvs = get_size();
+
+    // all layers carry the same cell->pool map; snapshot it for the in-graph dequant
+    memcpy(gi_old->data, layers[0].group_index->data, (size_t) kvs*n_stream*sizeof(int32_t));
+
+    // rebuild group_index from the post-shift positions so surviving cells and future writes agree
+    // on the pos/32 grouping again; the in-graph requant then re-encodes every referenced pool from
+    // the roped f32 values. staging drops with it - the open group's next write rescues its members
+    // from int4 (one bounded requant step) instead of folding stale residuals.
+    const uint32_t n_seqps   = n_seq_max / n_stream;
+    const uint32_t ng_max    = (uint32_t) layers[0].k_scalezp->ne[1];
+    const uint32_t band_size = ng_max / n_seqps;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+
+        for (uint32_t i = 0; i < kvs; ++i) {
+            int32_t pool = -1;
+            if (!cells.is_empty(i)) {
+                llama_seq_id sq = -1;
+                if (cells.seq_count(i) == 1) {
+                    sq = cells.seq_get(i);
+                } else {
+                    for (uint32_t cand = 0; cand < n_seq_max; ++cand) {   // shared cell: first owner's band
+                        if (cells.seq_has(i, cand)) { sq = (llama_seq_id) cand; break; }
+                    }
+                }
+                const uint32_t lg   = (uint32_t) cells.pos_get(i) / KPC_GROUP;
+                const uint32_t band = ((uint32_t) sq % n_seqps) * band_size;
+                pool = (int32_t) (band + lg % band_size);
+            }
+            for (const auto & layer : layers) {
+                ((int32_t *) layer.group_index->data)[(size_t) s*kvs + i] = pool;
+            }
+        }
+    }
+
+    for (uint32_t slot = 0; slot < n_seq_max; ++slot) {
+        kpc_clear_staging_slot((int32_t) slot);
     }
 }
 
@@ -1808,6 +2121,13 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        // KPC side tensors are part of the K-cache footprint
+        for (ggml_tensor * t : { layer.k_resid, layer.k_scalezp, layer.group_index,
+                                 layer.k_resid_slots, layer.staged_group, layer.staged_mask }) {
+            if (t) {
+                size_k_bytes += ggml_nbytes(t);
+            }
+        }
     }
 
     return size_k_bytes;
@@ -1832,7 +2152,8 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                 ggml_tensor * factors,
                       float   freq_base,
                       float   freq_scale,
-                   uint32_t   il) const {
+                   uint32_t   il,
+                ggml_tensor * kpc_gi_old) const {
     const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
 
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
@@ -1849,6 +2170,31 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                                 ? LLAMA_ROPE_TYPE_NEOX
                                 : hparams.rope_type;
     ggml_tensor * tmp;
+
+    if (type_k() == GGML_TYPE_KPC4_1) {
+        // KPC K-shift: dequant int4 K -> rope -> requant in place; streams flattened into the rope
+        // token dim. the dequant reads the pre-shift pool map (kpc_gi_old), the requant groups by the
+        // rebuilt post-shift group_index, so cells regroup consistently with future writes
+        GGML_ASSERT(rot == nullptr && "KPC K-shift does not support attn_rot_k");
+        GGML_ASSERT(kpc_gi_old != nullptr && "KPC K-shift needs the group_index snapshot input");
+        const int32_t ikv = map_layer_ids.at(il);
+        ggml_tensor * pk  = layers[ikv].k;            // [C, kv_size, n_stream] packed int4
+        ggml_tensor * szc = layers[ikv].k_scalezp;    // [KPC_SZ_GROUP_BYTES(C), ng_max, n_stream]
+        ggml_tensor * gic = layers[ikv].group_index;  // [kv_size, n_stream]
+        const int64_t C         = pk->ne[0];
+        const int64_t kv        = pk->ne[1];
+        const int64_t ns        = pk->ne[2];
+        const int64_t head_dim  = hparams.n_embd_head_k(il);
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+
+        ggml_tensor * kf32 = ggml_cast(ctx, ggml_kpc_dequant(ctx, pk, szc, kpc_gi_old), GGML_TYPE_F32);  // [C, kv, ns]
+        ggml_tensor * k3   = ggml_reshape_3d(ctx, kf32, head_dim, n_head_kv, kv*ns);                     // flatten streams
+        ggml_tensor * roped = ggml_rope_ext(ctx, k3,
+                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        ggml_tensor * roped3 = ggml_reshape_3d(ctx, roped, C, kv, ns);
+        return ggml_kpc_requant(ctx, pk, szc, gic, roped3);
+    }
 
     if (ggml_is_quantized(cur->type)) {
         // dequantize to f32 -> RoPE -> quantize back
@@ -1887,6 +2233,9 @@ public:
     // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
 
+    // KPC: pre-regroup cell->pool snapshot for the dequant pass; I32 [kv_size, n_stream]
+    ggml_tensor * kpc_gi_old = nullptr;
+
     const llama_kv_cache * kv_self;
 };
 
@@ -1899,6 +2248,10 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 
     if (k_rot) {
         kv_self->set_input_k_rot(k_rot);
+    }
+
+    if (kpc_gi_old) {
+        kv_self->set_input_kpc_shift(kpc_gi_old);
     }
 }
 
@@ -1915,6 +2268,11 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
+
+    if (kpc_enabled()) {
+        inp->kpc_gi_old = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, get_size(), n_stream);
+        ggml_set_input(inp->kpc_gi_old);
+    }
 
     const auto & cparams = lctx->get_cparams();
 
@@ -1933,14 +2291,16 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
+        // KPC: pass the raw cache tensor; build_rope_shift's KPC branch ignores the n_rot view
+        ggml_tensor * k = (layer.k->type == GGML_TYPE_KPC4_1)
+            ? layer.k
+            : ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il, inp->kpc_gi_old);
 
         ggml_build_forward_expand(gf, cur);
     }
@@ -1956,9 +2316,19 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    // KPC4_1 side tensors aren't transferred by the on-device seq io path; require the host path (flags=0)
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && kpc_enabled()) {
+        throw std::runtime_error("KPC4_1 KV cache does not support on-device sequence state; use the host path (flags=0)");
+    }
+    // per-sequence KPC4_1 save (host path): the K is emitted as dequantized f16 in state_write_data and the
+    // shared scalezp pools / group_index are NOT serialized; restore re-quantizes inline (see state_read_data).
 
     io.write(&n_stream, sizeof(n_stream));
+
+    // KPC slab framing and pool-band layout depend on this; a mismatched reader must refuse
+    if (kpc_enabled()) {
+        io.write(&n_seq_max, sizeof(n_seq_max));
+    }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         cell_ranges_t cr { s, {} };
@@ -2016,7 +2386,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         }
 
         state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
+        state_write_data(io, cr, seq_id);
     }
 }
 
@@ -2026,7 +2396,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         return;
     }
 
-    GGML_UNUSED(flags);
+    // see state_write: on-device seq state unsupported for KPC4_1 (side tensors not transferred)
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && kpc_enabled()) {
+        throw std::runtime_error("KPC4_1 KV cache does not support on-device sequence state; use the host path (flags=0)");
+    }
+    // per-sequence KPC4_1 restore (host path) is supported: state_read_data re-quantizes the f16 K inline.
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -2034,6 +2408,18 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
+    }
+
+    // the stored group_index pool ids and staging slabs were laid out under this; refuse a mismatch
+    // instead of silently decoding old cells against wrong pool bands
+    if (kpc_enabled()) {
+        uint32_t n_seq_max_cur = 0;
+        io.read(&n_seq_max_cur, sizeof(n_seq_max_cur));
+        if (n_seq_max_cur != n_seq_max) {
+            throw std::runtime_error(format(
+                "KPC4_1 state was saved with n_seq_max=%u but this context has %u; "
+                "restore requires a matching configuration", n_seq_max_cur, n_seq_max));
+        }
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2050,7 +2436,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
-        res = res && state_read_data(io, strm, cell_count, sinfo);
+        res = res && state_read_data(io, strm, cell_count, sinfo, seq_id);
 
         if (!res) {
             if (seq_id == -1) {
@@ -2096,7 +2482,59 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+// Inline KPC quant math for per-sequence state save/restore, which runs in the I/O layer (no compute graph).
+// Mirrors the wire format of ggml-cpu/kpc.cpp; the Stage-1 DEQUANT path is q8_0/f16-class (near-lossless), so these
+// need not be bit-exact vs the kernel's fp16 - the live attention path reads what we write via the same IEEE fp16 +
+// nibble layout. (Stage 2's RAW fast path, which IS bit-exact, would share the kernel helpers directly instead.)
+namespace {
+    inline float kpc_inl_deq(uint8_t nib_byte, int c, float s, float z) {
+        const int q = (c & 1) ? (nib_byte >> 4) : (nib_byte & 0x0F);
+        return q * s + z;
+    }
+    inline void kpc_inl_pack(uint8_t * row, int64_t c, float v, float s, float z) {
+        int qv = (int)((v - z)/s + 0.5f); if (qv < 0) qv = 0; if (qv > 15) qv = 15;
+        uint8_t * b = &row[c/2];
+        *b = (c & 1) ? ((*b & 0x0F) | (uint8_t)(qv << 4)) : ((*b & 0xF0) | (uint8_t) qv);
+    }
+    inline void kpc_inl_super_read(const uint8_t * slab, float * ss, float * zmin, float * sz) {
+        ggml_fp16_t h;
+        memcpy(&h, slab + 0, 2); *ss   = ggml_fp16_to_fp32(h);
+        memcpy(&h, slab + 2, 2); *zmin = ggml_fp16_to_fp32(h);
+        memcpy(&h, slab + 4, 2); *sz   = ggml_fp16_to_fp32(h);
+    }
+    inline void kpc_inl_dec1(const uint8_t * slab, int64_t C, int64_t c, float ss, float zmin, float sz, float * scale, float * zp) {
+        *scale = slab[6 + c] * ss;
+        *zp    = zmin + slab[6 + C + c] * sz;
+    }
+    // encode per-channel float scale[C] (>=0) and zp[C] into one group's int8 slab (mirror kpc_sz_encode)
+    inline void kpc_inl_encode(const float * scale, const float * zp, int64_t C, uint8_t * slab) {
+        const int QMAX = 255;
+        float smax = 0.0f; for (int64_t c = 0; c < C; ++c) if (scale[c] > smax) smax = scale[c];
+        float ss = smax / (float) QMAX; if (ss == 0.0f) ss = 1.0f;
+        float zmn = INFINITY, zmx = -INFINITY;
+        for (int64_t c = 0; c < C; ++c) { if (zp[c] < zmn) zmn = zp[c]; if (zp[c] > zmx) zmx = zp[c]; }
+        float sz = (zmx - zmn) / (float) QMAX; if (sz == 0.0f) sz = 1.0f;
+        ggml_fp16_t h;
+        h = ggml_fp32_to_fp16(ss);  memcpy(slab + 0, &h, 2);
+        h = ggml_fp32_to_fp16(zmn); memcpy(slab + 2, &h, 2);
+        h = ggml_fp32_to_fp16(sz);  memcpy(slab + 4, &h, 2);
+        uint8_t * qs = slab + 6, * qz = slab + 6 + C;
+        for (int64_t c = 0; c < C; ++c) {
+            int s = (int)(scale[c] / ss + 0.5f);     if (s < 0) s = 0; if (s > QMAX) s = QMAX;
+            int z = (int)((zp[c] - zmn) / sz + 0.5f); if (z < 0) z = 0; if (z > QMAX) z = QMAX;
+            qs[c] = (uint8_t) s; qz[c] = (uint8_t) z;
+        }
+    }
+    // Stage 2 RAW fast path: per-seq save stores int4-K + scalezp verbatim (compact, bit-exact) for groups.
+    inline bool kpc_seq_raw_enabled() {
+        // Default ON: RAW stores int4-K + scalezp verbatim -> per-seq restore is BIT-EXACT (the DEQUANT path
+        // re-quantizes and is lossy ~0.1-0.6 logits). KPC_SEQ_RAW=0 forces the old f16 dequant path.
+        static const int v = [] { const char * e = getenv("KPC_SEQ_RAW"); return (e && e[0] == '0') ? 0 : 1; }();
+        return v != 0;
+    }
+}
+
+void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
@@ -2104,6 +2542,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
+
+    // per-sequence KPC4_1 save: emit K as dequantized f16 (no scalezp side block); restore re-quantizes inline
+    const bool kpc_seq = !layers.empty() && layers[0].k_scalezp && seq_id >= 0;
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
@@ -2113,6 +2554,61 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
         auto * k = layer.k_stream[cr.strm];
+
+        if (kpc_seq) {
+            const int64_t C = n_embd_k_gqa;
+            ggml_tensor * sz = layer.k_scalezp;
+            ggml_tensor * gi = layer.group_index;
+            const size_t  krow      = ggml_row_size(k->type, C);     // packed int4 row = C/2 bytes
+            const size_t  sz_stream = ggml_nbytes(sz) / sz->ne[2];   // per-stream slab bytes
+            const int64_t ng_max    = sz->ne[1];
+            const int64_t szgb      = GGML_KPC_SZ_GROUP_BYTES(C);
+            const uint8_t * kd  = (const uint8_t *) k->data;
+            const int32_t * gid = (const int32_t *) gi->data + (size_t) cr.strm * gi->ne[0];
+            const uint8_t * szd = (const uint8_t *) sz->data + (size_t) cr.strm * sz_stream;
+
+            // cells in token order (cr.data is sorted by cell index = token order for a contiguous seq)
+            std::vector<uint32_t> ord;
+            for (const auto & range : cr.data) for (uint32_t p = range.first; p < range.second; ++p) ord.push_back(p);
+            const int64_t G = GGML_KPC_GROUP;
+            const int64_t n_groups = ((int64_t) ord.size() + G - 1) / G;
+
+            const uint8_t kmode = kpc_seq_raw_enabled() ? 1 : 0;   // 0 = DEQUANT f16 (Stage 1), 1 = RAW int4+slab
+            io.write(&kmode, sizeof(kmode));
+
+            if (kmode == 1) {
+                const uint64_t krow_u = krow, szgb_u = (uint64_t) szgb;
+                io.write(&krow_u, sizeof(krow_u));
+                io.write(&szgb_u, sizeof(szgb_u));
+                for (int64_t lg = 0; lg < n_groups; ++lg) {
+                    const int64_t g_lo = lg*G, g_hi = std::min<int64_t>(g_lo + G, (int64_t) ord.size());
+                    int32_t pool = gid[ord[g_lo]]; if (pool < 0 || pool >= ng_max) pool = 0;
+                    for (int64_t i = g_lo; i < g_hi; ++i) io.write(kd + (size_t) ord[i]*krow, krow);  // int4 rows
+                    io.write(szd + (size_t) pool*szgb, szgb);                                          // scalezp slab
+                }
+            } else {
+                const int32_t  f16_type = (int32_t) GGML_TYPE_F16;
+                const uint64_t f16_row  = (uint64_t) C * sizeof(ggml_fp16_t);
+                io.write(&f16_type, sizeof(f16_type));
+                io.write(&f16_row,  sizeof(f16_row));
+                std::vector<float> scale(C), zp(C);
+                std::vector<ggml_fp16_t> frow(C);
+                for (uint32_t p : ord) {
+                    const int32_t pool = gid[p];
+                    const uint8_t * row = kd + (size_t) p * krow;
+                    if (pool >= 0 && pool < ng_max) {
+                        const uint8_t * slab = szd + (size_t) pool * szgb;
+                        float ss, zmin, szc; kpc_inl_super_read(slab, &ss, &zmin, &szc);
+                        for (int64_t c = 0; c < C; ++c) kpc_inl_dec1(slab, C, c, ss, zmin, szc, &scale[c], &zp[c]);
+                        for (int64_t c = 0; c < C; ++c) frow[c] = ggml_fp32_to_fp16(kpc_inl_deq(row[c/2], (int) c, scale[c], zp[c]));
+                    } else {
+                        for (int64_t c = 0; c < C; ++c) frow[c] = ggml_fp32_to_fp16(0.0f);   // unwritten cell
+                    }
+                    io.write(frow.data(), C * sizeof(ggml_fp16_t));
+                }
+            }
+            continue;
+        }
 
         // Write key type
         const int32_t k_type_i = (int32_t) k->type;
@@ -2192,6 +2688,37 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 }
             }
         }
+    }
+
+    // KPC4_1: serialize scale/zp + group_index (per stream) and the open-group staging (per sequence).
+    // Skipped for per-sequence save (kpc_seq): the K was emitted as f16 and restore re-quantizes inline.
+    for (const auto & layer : layers) {
+        if (!layer.k_scalezp || kpc_seq) {
+            continue;
+        }
+        ggml_tensor * sz  = layer.k_scalezp;     // [2C, ng_max, n_stream]
+        ggml_tensor * rs  = layer.k_resid;       // [C, GROUP, n_seq_max]
+        ggml_tensor * gi  = layer.group_index;   // [kv_size, n_stream]
+        ggml_tensor * rsl = layer.k_resid_slots; // [GROUP, n_seq_max]
+        ggml_tensor * sgp = layer.staged_group;  // [n_seq_max]
+        ggml_tensor * smk = layer.staged_mask;   // [n_seq_max]
+        const size_t sz_slab  = ggml_nbytes(sz)  / sz->ne[2];   // per-stream
+        const size_t gi_slab  = ggml_nbytes(gi)  / gi->ne[1];   // per-stream
+        const size_t rs_slab  = ggml_nbytes(rs)  / rs->ne[2];   // per-sequence
+        const size_t rsl_slab = ggml_nbytes(rsl) / rsl->ne[1];  // per-sequence
+        const size_t st_el    = ggml_type_size(GGML_TYPE_I32);  // one int32 per sequence
+        io.write_tensor(sz, cr.strm * sz_slab, sz_slab);
+        io.write_tensor(gi, cr.strm * gi_slab, gi_slab);
+        // staging indexed by seq_id: per-seq save writes one seq, full save writes all n_seq_max (unified holds
+        // all seqs in stream 0, so cr.strm alone would miss them)
+        const uint32_t seq_off = seq_id >= 0 ? (uint32_t) seq_id : (n_stream == 1 ? 0 : cr.strm);
+        const uint32_t seq_cnt = seq_id >= 0 ? 1                 : (n_stream == 1 ? n_seq_max : 1);
+        // prefix the slab count so the reader knows exactly what was written
+        io.write(&seq_cnt, sizeof(seq_cnt));
+        io.write_tensor(rs,  seq_off * rs_slab,  seq_cnt * rs_slab);
+        io.write_tensor(rsl, seq_off * rsl_slab, seq_cnt * rsl_slab);
+        io.write_tensor(sgp, seq_off * st_el,    seq_cnt * st_el);
+        io.write_tensor(smk, seq_off * st_el,    seq_cnt * st_el);
     }
 }
 
@@ -2314,7 +2841,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
-bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_seq_id dest_seq_id) {
+    // per-sequence KPC4_1 restore: K arrives as f16 and is re-quantized inline into int4 + scalezp + group_index
+    const bool kpc_seq = !layers.empty() && layers[0].k_scalezp && dest_seq_id >= 0;
+    if (!layers.empty() && layers[0].k_scalezp && !kpc_seq) {
+        // whole-cache: KPC slabs map back only for contiguous restore from a group boundary at head 0; refuse otherwise
+        if (!sinfo.is_contiguous() || sinfo.head() != 0) {
+            LLAMA_LOG_ERROR("%s: KPC4_1 state restore requires contiguous placement at head 0\n", __func__);
+            return false;
+        }
+    }
+
     auto & cells = v_cells[strm];
 
     uint32_t v_trans;
@@ -2345,6 +2882,111 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
         auto * k = layer.k_stream[strm];
+
+        if (kpc_seq) {
+            // Re-quantize each logical 32-token group into int4 + scalezp + group_index, scattering into the dst
+            // cells (sinfo.idxs[0]). Pool ids mirror the kernel's pool_of(sb=dest_seq_id, lg) banding so a
+            // subsequent decode reads/continues the sequence correctly. kmode 0 = DEQUANT f16, 1 = RAW int4+slab.
+            const int64_t C = n_embd_k_gqa;
+            ggml_tensor * sz = layer.k_scalezp;
+            ggml_tensor * gi = layer.group_index;
+            const size_t  krow      = ggml_row_size(k->type, C);
+            const size_t  sz_stream = ggml_nbytes(sz) / sz->ne[2];
+            const int64_t ng_max    = sz->ne[1];
+            const int64_t szgb      = GGML_KPC_SZ_GROUP_BYTES(C);
+            const int64_t n_seqps   = (int64_t) n_seq_max / (int64_t) n_stream;
+            const int64_t band_size = ng_max / n_seqps;
+            const int64_t G         = GGML_KPC_GROUP;
+            uint8_t * kd  = (uint8_t *) k->data;
+            int32_t * gid = (int32_t *) gi->data + (size_t) strm * gi->ne[0];
+            uint8_t * szd = (uint8_t *) sz->data + (size_t) strm * sz_stream;
+            const int64_t n_groups = ((int64_t) cell_count + G - 1) / G;
+
+            std::vector<float> scale(C), zp(C), nsc(C), nzp(C);
+            // re-quantize a group's f32 K [(g_hi-g_lo)*C] into int4 + scalezp + group_index at the dst cells
+            auto requant_group = [&](int64_t lg, int64_t g_lo, int64_t g_hi, const float * kf32) -> bool {
+                for (int64_t c = 0; c < C; ++c) {
+                    float mn = INFINITY, mx = -INFINITY;
+                    for (int64_t i = g_lo; i < g_hi; ++i) { const float v = kf32[(i - g_lo)*C + c]; if (v < mn) mn = v; if (v > mx) mx = v; }
+                    float s = (mx - mn) / 15.0f; if (s == 0.0f) s = 1.0f;
+                    scale[c] = s; zp[c] = mn;
+                }
+                const int64_t pool = ((int64_t) dest_seq_id % n_seqps) * band_size + (lg % band_size);
+                if (pool < 0 || pool >= ng_max) return false;
+                uint8_t * slab = szd + (size_t) pool * szgb;
+                kpc_inl_encode(scale.data(), zp.data(), C, slab);
+                float ss, zmin, szc; kpc_inl_super_read(slab, &ss, &zmin, &szc);
+                for (int64_t c = 0; c < C; ++c) { kpc_inl_dec1(slab, C, c, ss, zmin, szc, &nsc[c], &nzp[c]); if (nsc[c] == 0.0f) nsc[c] = 1.0f; }
+                for (int64_t i = g_lo; i < g_hi; ++i) {
+                    const uint32_t idx = sinfo.idxs[0][i];
+                    uint8_t * row = kd + (size_t) idx * krow;
+                    for (int64_t c = 0; c < C; ++c) kpc_inl_pack(row, c, kf32[(i - g_lo)*C + c], nsc[c], nzp[c]);
+                    gid[idx] = (int32_t) pool;
+                }
+                return true;
+            };
+
+            uint8_t kmode = 0; io.read(&kmode, sizeof(kmode));
+            if (kmode == 1) {
+                uint64_t krow_ref = 0, szgb_ref = 0;
+                io.read(&krow_ref, sizeof(krow_ref));
+                io.read(&szgb_ref, sizeof(szgb_ref));
+                if (krow_ref != (uint64_t) krow || szgb_ref != (uint64_t) szgb) {
+                    LLAMA_LOG_ERROR("%s: KPC4_1 per-seq RAW record mismatch (layer %d)\n", __func__, il);
+                    return false;
+                }
+                // RAW verbatim copy: scatter each int4 row to its dst cell and the per-group slab to the dst pool.
+                // A saved sequence has contiguous positions, so every 32-token group maps to exactly one pool -> the
+                // byte-copy is bit-exact regardless of CELL alignment (the prior head%32==0 gate forced a lossy
+                // requant for the common live-restore-into-occupied-cells case).
+                const bool aligned = true;
+                std::vector<uint8_t> rows; std::vector<uint8_t> slab(szgb); std::vector<float> kf32;
+                for (int64_t lg = 0; lg < n_groups; ++lg) {
+                    const int64_t g_lo = lg * G, g_hi = std::min<int64_t>(g_lo + G, cell_count);
+                    const int64_t n = g_hi - g_lo;
+                    rows.resize((size_t) n * krow);
+                    io.read(rows.data(), (size_t) n * krow);
+                    io.read(slab.data(), szgb);
+                    const int64_t pool = ((int64_t) dest_seq_id % n_seqps) * band_size + (lg % band_size);
+                    if (pool < 0 || pool >= ng_max) { LLAMA_LOG_ERROR("%s: KPC4_1 per-seq pool oob (layer %d)\n", __func__, il); return false; }
+                    if (aligned) {
+                        memcpy(szd + (size_t) pool*szgb, slab.data(), szgb);
+                        for (int64_t i = g_lo; i < g_hi; ++i) {
+                            const uint32_t idx = sinfo.idxs[0][i];
+                            memcpy(kd + (size_t) idx*krow, rows.data() + (size_t)(i - g_lo)*krow, krow);
+                            gid[idx] = (int32_t) pool;
+                        }
+                    } else {
+                        float ss, zmin, szc; kpc_inl_super_read(slab.data(), &ss, &zmin, &szc);
+                        for (int64_t c = 0; c < C; ++c) kpc_inl_dec1(slab.data(), C, c, ss, zmin, szc, &scale[c], &zp[c]);
+                        kf32.resize((size_t) n * C);
+                        for (int64_t i = 0; i < n; ++i) { const uint8_t * row = rows.data() + (size_t) i*krow;
+                            for (int64_t c = 0; c < C; ++c) kf32[(size_t) i*C + c] = kpc_inl_deq(row[c/2], (int) c, scale[c], zp[c]); }
+                        if (!requant_group(lg, g_lo, g_hi, kf32.data())) { LLAMA_LOG_ERROR("%s: KPC4_1 per-seq pool oob (layer %d)\n", __func__, il); return false; }
+                    }
+                }
+            } else {
+                int32_t  ftype_ref = 0; io.read(&ftype_ref, sizeof(ftype_ref));
+                uint64_t frow_ref  = 0; io.read(&frow_ref,  sizeof(frow_ref));
+                if (ftype_ref != (int32_t) GGML_TYPE_F16 || frow_ref != (uint64_t) C * sizeof(ggml_fp16_t)) {
+                    LLAMA_LOG_ERROR("%s: KPC4_1 per-seq K record mismatch (layer %d)\n", __func__, il);
+                    return false;
+                }
+                std::vector<ggml_fp16_t> kf16((size_t) cell_count * C);
+                io.read(kf16.data(), (size_t) cell_count * C * sizeof(ggml_fp16_t));
+                std::vector<float> kf32(C * G);
+                for (int64_t lg = 0; lg < n_groups; ++lg) {
+                    const int64_t g_lo = lg * G, g_hi = std::min<int64_t>(g_lo + G, cell_count);
+                    for (int64_t i = g_lo; i < g_hi; ++i)
+                        for (int64_t c = 0; c < C; ++c) kf32[(i - g_lo)*C + c] = ggml_fp16_to_fp32(kf16[(size_t) i*C + c]);
+                    if (!requant_group(lg, g_lo, g_hi, kf32.data())) {
+                        LLAMA_LOG_ERROR("%s: KPC4_1 per-seq pool out of range (layer %d)\n", __func__, il);
+                        return false;
+                    }
+                }
+            }
+            continue;
+        }
 
         // Read type of key
         int32_t k_type_i_ref;
@@ -2479,6 +3121,43 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    // KPC4_1: restore scale/zp + group_index (per stream) and staging (per sequence); mirrors state_write_data.
+    // Skipped for per-sequence restore (kpc_seq): scalezp + group_index were rebuilt by the inline requant above.
+    for (const auto & layer : layers) {
+        if (!layer.k_scalezp || kpc_seq) {
+            continue;
+        }
+        ggml_tensor * sz  = layer.k_scalezp;
+        ggml_tensor * rs  = layer.k_resid;
+        ggml_tensor * gi  = layer.group_index;
+        ggml_tensor * rsl = layer.k_resid_slots;
+        ggml_tensor * sgp = layer.staged_group;
+        ggml_tensor * smk = layer.staged_mask;
+        const size_t sz_slab  = ggml_nbytes(sz)  / sz->ne[2];   // per-stream
+        const size_t gi_slab  = ggml_nbytes(gi)  / gi->ne[1];   // per-stream
+        const size_t rs_slab  = ggml_nbytes(rs)  / rs->ne[2];   // per-sequence
+        const size_t rsl_slab = ggml_nbytes(rsl) / rsl->ne[1];  // per-sequence
+        const size_t st_el    = ggml_type_size(GGML_TYPE_I32);  // one int32 per sequence
+        io.read_tensor(sz, strm * sz_slab, sz_slab);
+        io.read_tensor(gi, strm * gi_slab, gi_slab);
+        const uint32_t seq_off = dest_seq_id >= 0 ? (uint32_t) dest_seq_id : (n_stream == 1 ? 0 : strm);
+        // read the recorded slab count, place what fits, discard overflow to keep the stream framed
+        uint32_t n_stage = 0;
+        io.read(&n_stage, sizeof(n_stage));
+        const uint32_t cap  = seq_off < n_seq_max ? n_seq_max - seq_off : 0;
+        const uint32_t fit  = std::min(n_stage, cap);
+        const uint32_t over = n_stage - fit;
+        std::vector<char> scratch;
+        auto read_block = [&](ggml_tensor * t, size_t slab) {
+            if (fit)  io.read_tensor(t, seq_off * slab, fit * slab);
+            if (over) { scratch.resize(over * slab); io.read(scratch.data(), over * slab); }
+        };
+        read_block(rs,  rs_slab);
+        read_block(rsl, rsl_slab);
+        read_block(sgp, st_el);
+        read_block(smk, st_el);
+    }
+
     return true;
 }
 
@@ -2575,12 +3254,20 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k_scalezp(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_scalezp(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_groupidx(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_groupidx(ctx, il, n_kv, sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * kpc_seq, ggml_tensor * kpc_pos, int32_t il) const {
+    return kv->cpy_k(ctx, k_cur, k_idxs, kpc_seq, kpc_pos, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
@@ -2593,6 +3280,14 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_kpc_seq(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_kpc_seq(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_kpc_pos(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_kpc_pos(ctx, ubatch);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
@@ -2613,6 +3308,10 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const llama_ubatch * ubatch) const {
+    kv->set_input_kpc(seq, pos, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
