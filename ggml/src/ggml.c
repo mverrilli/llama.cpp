@@ -671,6 +671,31 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
+    // reserved gap between Q1_0 (41) and KPC4_1 (45); named so lookups never see a NULL type_name
+    [42] = {
+        .type_name                = "unused_42",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [43] = {
+        .type_name                = "unused_43",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [44] = {
+        .type_name                = "unused_44",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_KPC4_1] = {
+        .type_name                = "kpc4_1",
+        .blck_size                = 32,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1076,9 +1101,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "KPC_DEQUANT",
+    "KPC_FLASH_ATTN",
+    "KPC_WRITE",
+    "KPC_REQUANT",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1216,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "kpc_dequant(x)",
+    "kpc_attn(x)",
+    "kpc_write(x)",
+    "kpc_requant(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5354,6 +5387,134 @@ struct ggml_tensor * ggml_arange(
     ggml_set_op_params_f32(result, 2, step);
 
     result->op = GGML_OP_ARANGE;
+
+    return result;
+}
+
+// ggml_kpc_dequant
+
+struct ggml_tensor * ggml_kpc_dequant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * scalezp,
+        struct ggml_tensor  * group_index) {
+    const int64_t C  = packed->ne[0];
+    const int64_t T  = packed->ne[1];
+    const int64_t NS = packed->ne[2];   // stream dim (1 for single-stream / unified)
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, C, T, NS);
+
+    result->op     = GGML_OP_KPC_DEQUANT;
+    result->src[0] = packed;
+    result->src[1] = scalezp;
+    result->src[2] = group_index;   // optional: per-slot pool index (NULL -> contiguous t/32)
+
+    return result;
+}
+
+// ggml_kpc_attn
+
+struct ggml_tensor * ggml_kpc_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed_k,
+        struct ggml_tensor  * scalezp,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * group_index,
+        struct ggml_tensor  * sinks,
+        float                 kq_scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    if (max_bias > 0.0f) {
+        GGML_ASSERT(mask);
+    }
+    if (sinks) {
+        GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+        GGML_ASSERT(sinks->ne[0] == q->ne[2]);   // one sink logit per head
+    }
+
+    const int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { kq_scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KPC_FLASH_ATTN;
+    result->src[0] = q;
+    result->src[1] = packed_k;
+    result->src[2] = scalezp;
+    result->src[3] = v;
+    result->src[4] = mask;
+    result->src[5] = group_index;
+    result->src[6] = sinks;
+
+    return result;
+}
+
+// ggml_kpc_write
+
+struct ggml_tensor * ggml_kpc_write(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * scalezp,
+        struct ggml_tensor  * k_resid,
+        struct ggml_tensor  * group_index,
+        struct ggml_tensor  * k_resid_slots,
+        struct ggml_tensor  * staged_group,
+        struct ggml_tensor  * staged_mask,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * k_idxs,
+        struct ggml_tensor  * kpc_seq,
+        struct ggml_tensor  * kpc_pos) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k);   // alias-write in place
+
+    GGML_ASSERT(kpc_seq->type == GGML_TYPE_I32 && kpc_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(kpc_seq->ne[0] == k_cur->ne[1] && kpc_pos->ne[0] == kpc_seq->ne[0]);
+
+    // op_params unused: n_tokens/kv_size/ng_max/n_seq_max all come from the src tensor shapes;
+    // zero-init for the kernel's fixed memcpy
+    int32_t params[16] = { 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KPC_WRITE;
+    result->src[0] = k_cur;
+    result->src[1] = scalezp;
+    result->src[2] = k_resid;
+    result->src[3] = k_idxs;
+    result->src[4] = group_index;
+    result->src[5] = k_resid_slots;
+    result->src[6] = staged_group;
+    result->src[7] = staged_mask;
+    result->src[8] = kpc_seq;
+    result->src[9] = kpc_pos;
+
+    return result;
+}
+
+// ggml_kpc_requant
+
+struct ggml_tensor * ggml_kpc_requant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * scalezp,
+        struct ggml_tensor  * group_index,
+        struct ggml_tensor  * roped) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k);   // alias-write the packed K cache in place
+
+    GGML_ASSERT(roped->type == GGML_TYPE_F32 && "KPC requant: roped K must be f32");
+    GGML_ASSERT(group_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(roped->ne[1] == group_index->ne[0]);          // one pool index per cell
+    GGML_ASSERT(roped->ne[2] == group_index->ne[1]);          // per-stream pool-index slabs
+
+    // ng_max: scalezp pool count, used to clamp pool indices
+    int32_t params[16] = { (int32_t) scalezp->ne[1] };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_KPC_REQUANT;
+    result->src[0] = roped;
+    result->src[1] = group_index;
+    result->src[2] = scalezp;
 
     return result;
 }

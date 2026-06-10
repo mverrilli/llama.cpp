@@ -171,8 +171,13 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // side-tensor view for fused attn
+    ggml_tensor * get_k_scalezp(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_groupidx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+    // kpc_seq/kpc_pos are the per-token primary seq + position inputs used by the KPC int4 K write (may be null)
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * kpc_seq, ggml_tensor * kpc_pos, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
@@ -200,11 +205,17 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // KPC int4 K write: per-token primary seq (I32) and true position (I32)
+    ggml_tensor * build_input_kpc_seq(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_kpc_pos(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    void set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -213,6 +224,14 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // test hook: KPC open-group staging bitmask for (layer il, staging slot); 0 == no open group.
+    // used to assert seq_rm clears staging so a reused seq id can't fold stale residuals.
+    int32_t kpc_staged_mask(uint32_t il, int32_t slot) const;
+
+    // K-shift regroup: snapshot the old cell->pool map into gi_old, then rebuild group_index
+    // from post-shift cell positions, reset cursors and drop staging (see build_graph_shift)
+    void set_input_kpc_shift(ggml_tensor * gi_old) const;
 
 private:
     const llama_model & model;
@@ -228,6 +247,13 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        ggml_tensor * k_scalezp   = nullptr; // KPC: int8 scale/zp metadata slabs I8 [KPC_SZ_GROUP_BYTES(C), ng_max, n_stream]
+        ggml_tensor * k_resid     = nullptr; // KPC: f16 staging of the open group F16 [n_embd_k_gqa, KPC_GROUP, n_seq_max]
+        ggml_tensor * group_index = nullptr; // KPC: cell -> scalezp pool index (-1 = free) I32 [kv_size, n_stream]
+        ggml_tensor * k_resid_slots = nullptr; // KPC: physical slot of each staged member I32 [KPC_GROUP, n_seq_max]
+        ggml_tensor * staged_group  = nullptr; // KPC: logical group staged in k_resid, per seq I32 [n_seq_max]
+        ggml_tensor * staged_mask   = nullptr; // KPC: bitmask of staged positions, per seq I32 [n_seq_max]
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -289,6 +315,21 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
+    // KPC lifecycle helpers (no-ops when type_k is not KPC4_1)
+    bool kpc_enabled() const { return !layers.empty() && layers[0].k_scalezp; }
+    // staging slab index of a seq (slot == seq)
+    int32_t kpc_slot_of(llama_seq_id seq_id) const;
+    // clear a staging slot's open group on all layers
+    void kpc_clear_staging_slot(int32_t slot) const;
+    // retire a sequence's staging: clear the open group so a reused seq id starts clean
+    void kpc_retire_seq(llama_seq_id seq_id) const;
+    // drop staged members of a sequence's open group with true position in [p0, p1)
+    void kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // mark a freed cell's group_index entry unmapped (-1) on all layers
+    void kpc_free_cell(uint32_t strm, uint32_t i) const;
+    // reset all KPC bookkeeping: staging and group_index (-1)
+    void kpc_reset_state() const;
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
@@ -298,7 +339,8 @@ private:
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,
-                       uint32_t   il) const;
+                       uint32_t   il,
+                    ggml_tensor * kpc_gi_old = nullptr) const;
 
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
@@ -311,10 +353,10 @@ private:
     };
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_seq_id dest_seq_id = -1);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -367,6 +409,8 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_scalezp(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_groupidx(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -374,7 +418,7 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, ggml_tensor * kpc_seq, ggml_tensor * kpc_pos, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
@@ -383,11 +427,16 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    ggml_tensor * build_input_kpc_seq(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_kpc_pos(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

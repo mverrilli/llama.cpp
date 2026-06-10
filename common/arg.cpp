@@ -349,31 +349,49 @@ static handle_model_result common_params_handle_model(struct common_params_model
     return result;
 }
 
-const std::vector<ggml_type> kv_cache_types = {
-    GGML_TYPE_F32,
-    GGML_TYPE_F16,
-    GGML_TYPE_BF16,
-    GGML_TYPE_Q8_0,
-    GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_1,
-    GGML_TYPE_IQ4_NL,
-    GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1,
+struct kv_cache_type_entry {
+    ggml_type type;
+    bool k;
+    bool v;
 };
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
-    for (const auto & type : kv_cache_types) {
-        if (ggml_type_name(type) == s) {
-            return type;
+static const std::vector<kv_cache_type_entry> kv_cache_types = {
+    { GGML_TYPE_F32,    true,  true  },
+    { GGML_TYPE_F16,    true,  true  },
+    { GGML_TYPE_BF16,   true,  true  },
+    { GGML_TYPE_Q8_0,   true,  true  },
+    { GGML_TYPE_Q4_0,   true,  true  },
+    { GGML_TYPE_Q4_1,   true,  true  },
+    { GGML_TYPE_IQ4_NL, true,  true  },
+    { GGML_TYPE_Q5_0,   true,  true  },
+    { GGML_TYPE_Q5_1,   true,  true  },
+    { GGML_TYPE_KPC4_1, true,  false },
+};
+
+static ggml_type kv_cache_type_from_str(const std::string & s, bool k_side) {
+    for (const auto & entry : kv_cache_types) {
+        if (ggml_type_name(entry.type) == s) {
+            if (k_side && !entry.k) {
+                throw std::runtime_error("cache type '" + s + "' is V-only, not valid for -ctk");
+            }
+            if (!k_side && !entry.v) {
+                throw std::runtime_error("cache type '" + s + "' is K-only, not valid for -ctv");
+            }
+            return entry.type;
         }
     }
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-static std::string get_all_kv_cache_types() {
+static std::string get_all_kv_cache_types(bool k_side) {
     std::ostringstream msg;
-    for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    bool first = true;
+    for (const auto & entry : kv_cache_types) {
+        if (!(k_side ? entry.k : entry.v)) {
+            continue;
+        }
+        msg << (first ? "" : ", ") << ggml_type_name(entry.type);
+        first = false;
     }
     return msg.str();
 }
@@ -2046,11 +2064,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            params.cache_type_k = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2059,11 +2077,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(false).c_str(),
             ggml_type_name(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_v = kv_cache_type_from_str(value);
+            params.cache_type_v = kv_cache_type_from_str(value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -3494,11 +3512,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(true).c_str(),
             ggml_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -3507,11 +3525,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(false).c_str(),
             ggml_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(

@@ -402,6 +402,10 @@ llama_context::llama_context(
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
+            if (params.type_k == GGML_TYPE_KPC4_1) {
+                LLAMA_LOG_WARN("%s: kpc4_1 K cache with Flash Attention disabled falls back to a dequantize-to-F16 "
+                    "path each forward pass; kpc's fused decode speed-up requires Flash Attention on\n", __func__);
+            }
         }
     }
 
@@ -1362,6 +1366,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2944,6 +2949,12 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // need at least the magic + seq_id header to read below
+    if (src == nullptr || size < sizeof(io_magic) + sizeof(llama_seq_id)) {
+        LLAMA_LOG_ERROR("%s: sequence state buffer too small (%zu bytes)\n", __func__, size);
+        return 0;
+    }
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3546,6 +3557,18 @@ llama_context * llama_init_from_model(
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
         return nullptr;
+    }
+
+    if (params.type_k == GGML_TYPE_KPC4_1 && model->hparams.is_mla()) {
+        LLAMA_LOG_ERROR("%s: kpc4_1 K cache is not supported with MLA models (e.g. deepseek2/deepseek32): "
+            "MLA reuses the K cache as V, which int4-packed K cannot serve\n", __func__);
+        return nullptr;
+    }
+
+    if (params.type_k == GGML_TYPE_KPC4_1 && !ggml_is_quantized(params.type_v)) {
+        LLAMA_LOG_WARN("%s: kpc4_1 K cache is paired with a full-precision V cache (%s); the V half is left at full "
+            "size, so only the K half of the KV cache is reduced. Pair it with a quantized V (e.g. q4_1) for the "
+            "full reduction\n", __func__, ggml_type_name(params.type_v));
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
