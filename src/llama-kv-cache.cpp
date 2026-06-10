@@ -160,6 +160,11 @@ llama_kv_cache::llama_kv_cache(
     }
     kpc_seq2slot.assign(n_seq_max, -1);
     kpc_slot_used.assign(kpc_staging_slots, 0);
+    // eager-close: env-enabled only while virtualized (else exhaustion is a hard error)
+    const char * kpc_eager_env = getenv("KPC_EAGER_CLOSE");
+    kpc_eager_close = (kpc_staging_slots != n_seq_max) && kpc_eager_env && atoi(kpc_eager_env) != 0;
+    kpc_slot2seq.assign(kpc_staging_slots, -1);
+    kpc_eff_offset.assign(n_seq_max, 0);
 
     if (type_k == GGML_TYPE_KPC4_1) {
         // each of the n_seqps sequences sharing a stream needs at least one scalezp pool in its band
@@ -573,9 +578,11 @@ void llama_kv_cache::kpc_retire_seq(llama_seq_id seq_id) const {
     const int32_t slot = kpc_slot_of(seq_id);
     if (kpc_virtualized() && slot >= 0) {
         kpc_slot_used[slot]  = 0;
+        kpc_slot2seq[slot]   = -1;
         kpc_seq2slot[seq_id] = -1;
     }
     kpc_clear_staging_slot(slot);
+    kpc_eff_offset[seq_id] = 0;   // retired -> reset the logical-group cursor
 }
 
 void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -586,6 +593,7 @@ void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_p
     if (slot < 0) {
         return;
     }
+    const llama_pos off = KPC_GROUP*kpc_eff_offset[seq_id];   // staged groups live in cursor-shifted space
     for (const auto & layer : layers) {
         if (!layer.staged_mask) {
             continue;
@@ -596,7 +604,7 @@ void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_p
         }
         const int32_t grp = ((const int32_t *) layer.staged_group->data)[slot];
         for (int w = 0; w < KPC_GROUP; ++w) {
-            const llama_pos pos = (llama_pos) grp*KPC_GROUP + w;
+            const llama_pos pos = (llama_pos) grp*KPC_GROUP + w - off;
             if ((mask & (1 << w)) && pos >= p0 && pos < p1) {
                 mask &= ~(1 << w);
             }
@@ -616,8 +624,10 @@ void llama_kv_cache::kpc_free_cell(uint32_t strm, uint32_t i) const {
 }
 
 void llama_kv_cache::kpc_reset_state() const {
-    std::fill(kpc_seq2slot.begin(),  kpc_seq2slot.end(),  -1);
-    std::fill(kpc_slot_used.begin(), kpc_slot_used.end(),  0);
+    std::fill(kpc_seq2slot.begin(),   kpc_seq2slot.end(),   -1);
+    std::fill(kpc_slot_used.begin(),  kpc_slot_used.end(),   0);
+    std::fill(kpc_slot2seq.begin(),   kpc_slot2seq.end(),   -1);
+    std::fill(kpc_eff_offset.begin(), kpc_eff_offset.end(),  0);
     if (!kpc_enabled()) {
         return;
     }
@@ -1742,6 +1752,22 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
 
     const bool virtualized = kpc_virtualized();
 
+    // in-flight -> never evictable
+    std::vector<char> in_ubatch;
+    if (kpc_eager_close) {
+        in_ubatch.assign(n_seq_max, 0);
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const llama_seq_id sb = ubatch->seq_id[t][0];
+            if (sb >= 0 && sb < (int) n_seq_max) in_ubatch[sb] = 1;
+        }
+    }
+
+    // seqs that spilled this ubatch (no slot, none evictable) -> bump cursor after the loop
+    std::vector<char> spilled;
+    if (virtualized) {
+        spilled.assign(n_seq_max, 0);
+    }
+
     // same token ordering as set_input_k_idxs (ti = s*size + i) so kpc_seq/kpc_pos/k_idxs index-align.
     // kpc_seq packs staging slot in high bits, seq_id in low bits (slot==seq when not virtualized)
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1758,20 +1784,44 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
                     for (uint32_t c = 0; c < kpc_staging_slots; ++c) {
                         if (!kpc_slot_used[c]) { slot = (int32_t) c; break; }
                     }
-                    if (slot < 0) {
-                        throw std::runtime_error("KPC staging slots exhausted (KPC_STAGING_SLOTS=" +
-                            std::to_string(kpc_staging_slots) + "): more concurrent sequences than slots; "
-                            "raise KPC_STAGING_SLOTS or reduce parallelism");
+                    if (slot < 0 && kpc_eager_close) {
+                        // evict an idle seq: free its slot, bump its cursor so its continuation lands in a fresh pool
+                        for (uint32_t c = 0; c < kpc_staging_slots; ++c) {
+                            const int32_t victim = kpc_slot2seq[c];
+                            if (victim >= 0 && !in_ubatch[victim]) {
+                                kpc_seq2slot[victim] = -1;
+                                kpc_eff_offset[victim] += 1;   // its next write starts a new logical group
+                                kpc_slot_used[c] = 0;
+                                kpc_slot2seq[c]  = -1;
+                                slot = (int32_t) c;
+                                break;
+                            }
+                        }
                     }
-                    kpc_seq2slot[sb]    = slot;
-                    kpc_slot_used[slot] = 1;
-                    // reused slot may carry a prior seq's abandoned open group -> clear it
-                    kpc_clear_staging_slot(slot);
+                    if (slot < 0) {
+                        // spill: no slot, none evictable -> write with the no-stage sentinel (slot == L)
+                        spilled[sb] = 1;
+                        slot = (int32_t) kpc_staging_slots;   // == L : the write kernel's no-stage sentinel
+                    } else {
+                        kpc_seq2slot[sb]    = slot;
+                        kpc_slot_used[slot] = 1;
+                        kpc_slot2seq[slot]  = sb;
+                        // reused slot may carry a prior seq's abandoned open group -> clear it
+                        kpc_clear_staging_slot(slot);
+                    }
                 }
             }
 
+            // virtual position: logical group = pos/32 + eff_offset, within-group index w = pos%32 preserved
             seq_data[ti] = sb | (slot << KPC_SLOT_SHIFT);
-            pos_data[ti] = ubatch->pos[ti];
+            pos_data[ti] = ubatch->pos[ti] + 32*kpc_eff_offset[sb];
+        }
+    }
+
+    // bump spilled-seq cursors after writing pos_data so this ubatch used the pre-bump offset
+    for (uint32_t sb = 0; sb < (uint32_t) spilled.size(); ++sb) {
+        if (spilled[sb]) {
+            kpc_eff_offset[sb] += 1;
         }
     }
 }
@@ -1832,10 +1882,8 @@ void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
     // all layers carry the same cell->pool map; snapshot it for the in-graph dequant
     memcpy(gi_old->data, layers[0].group_index->data, (size_t) kvs*n_stream*sizeof(int32_t));
 
-    // rebuild group_index from the post-shift positions so surviving cells and future writes agree
-    // on the pos/32 grouping again; the in-graph requant then re-encodes every referenced pool from
-    // the roped f32 values. staging drops with it - the open group's next write rescues its members
-    // from int4 (one bounded requant step) instead of folding stale residuals.
+    // rebuild group_index from the post-shift positions; the in-graph requant re-encodes every
+    // referenced pool. cursors reset and staging drops - the next write rescues the open group.
     const uint32_t n_seqps   = n_seq_max / n_stream;
     const uint32_t ng_max    = (uint32_t) layers[0].k_scalezp->ne[1];
     const uint32_t band_size = ng_max / n_seqps;
@@ -1864,6 +1912,7 @@ void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
         }
     }
 
+    std::fill(kpc_eff_offset.begin(), kpc_eff_offset.end(), 0);
     for (uint32_t slot = 0; slot < kpc_staging_slots; ++slot) {
         kpc_clear_staging_slot((int32_t) slot);
     }
@@ -2369,11 +2418,6 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
     // per-sequence KPC4_1 save (host path): the K is emitted as dequantized f16 in state_write_data and the
     // shared scalezp pools / group_index are NOT serialized; restore re-quantizes inline (see state_read_data).
-    // prototype limitation: the seq->staging-slot map is not (yet) serialized, so virtualized staging cannot
-    // round-trip through save/restore. The default (KPC_STAGING_SLOTS == n_seq_max) path is fully supported.
-    if (kpc_enabled() && kpc_staging_slots != n_seq_max) {
-        throw std::runtime_error("KPC4_1 state save/restore is unsupported with virtualized staging (KPC_STAGING_SLOTS < n_seq_max)");
-    }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2441,6 +2485,16 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr, seq_id);
     }
+
+    // serialize the seq->slot map + per-seq group cursor (not in the staging slabs); n_maps==0 = non-virtualized
+    if (!layers.empty() && layers[0].k_scalezp) {
+        const uint32_t n_maps = kpc_virtualized() ? n_seq_max : 0;
+        io.write(&n_maps, sizeof(n_maps));
+        if (n_maps) {
+            io.write(kpc_eff_offset.data(), n_maps * sizeof(int32_t));
+            io.write(kpc_seq2slot.data(),   n_maps * sizeof(int32_t));
+        }
+    }
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -2454,10 +2508,6 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("KPC4_1 KV cache does not support on-device sequence state; use the host path (flags=0)");
     }
     // per-sequence KPC4_1 restore (host path) is supported: state_read_data re-quantizes the f16 K inline.
-    // mirror of state_write: virtualized staging does not round-trip yet
-    if (kpc_enabled() && kpc_staging_slots != n_seq_max) {
-        throw std::runtime_error("KPC4_1 state save/restore is unsupported with virtualized staging (KPC_STAGING_SLOTS < n_seq_max)");
-    }
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -2502,6 +2552,31 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 seq_rm(seq_id, -1, -1);
             }
             throw std::runtime_error("failed to restore kv cache");
+        }
+    }
+
+    // restore the seq->slot map + per-seq cursor and rebuild slot occupancy; n_maps==0 = non-virtualized
+    if (!layers.empty() && layers[0].k_scalezp) {
+        uint32_t n_maps = 0;
+        io.read(&n_maps, sizeof(n_maps));
+        if (n_maps) {
+            std::vector<int32_t> eff(n_maps), s2s(n_maps);
+            io.read(eff.data(), n_maps * sizeof(int32_t));
+            io.read(s2s.data(), n_maps * sizeof(int32_t));
+            std::fill(kpc_slot_used.begin(), kpc_slot_used.end(), (char) 0);
+            std::fill(kpc_slot2seq.begin(),  kpc_slot2seq.end(),  -1);
+            const uint32_t ncopy = std::min<uint32_t>(n_maps, n_seq_max);
+            for (uint32_t sq = 0; sq < ncopy; ++sq) {
+                kpc_eff_offset[sq] = eff[sq];
+                const int32_t slot = s2s[sq];
+                if (slot >= 0 && slot < (int32_t) kpc_staging_slots) {
+                    kpc_seq2slot[sq]    = slot;
+                    kpc_slot_used[slot] = 1;
+                    kpc_slot2seq[slot]  = (int32_t) sq;
+                } else {
+                    kpc_seq2slot[sq] = -1;   // saved slot doesn't fit this context's L -> seq re-claims a fresh one
+                }
+            }
         }
     }
 }
@@ -2664,6 +2739,24 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     io.write(frow.data(), C * sizeof(ggml_fp16_t));
                 }
             }
+            // Save this sequence's OPEN-group staging: staged_group + staged_mask + the exact (pre-quant f16)
+            // residual window, so a continuing decode after restore re-seals the partial last group bit-faithfully.
+            // (The whole-cache staging serialize is skipped for kpc_seq; this carries the open group per-sequence.)
+            {
+                const int slot = kpc_virtualized()
+                    ? (seq_id < (int) kpc_seq2slot.size() ? kpc_seq2slot[seq_id] : -1) : (int) seq_id;
+                const int64_t GxC = G * C;
+                int32_t sgv = -1, smv = 0;
+                std::vector<ggml_fp16_t> resid((size_t) GxC, ggml_fp32_to_fp16(0.0f));
+                if (slot >= 0) {
+                    ggml_backend_tensor_get(layer.staged_group, &sgv, (size_t) slot * sizeof(int32_t), sizeof(int32_t));
+                    ggml_backend_tensor_get(layer.staged_mask,  &smv, (size_t) slot * sizeof(int32_t), sizeof(int32_t));
+                    ggml_backend_tensor_get(layer.k_resid, resid.data(), (size_t) slot * GxC * sizeof(ggml_fp16_t), (size_t) GxC * sizeof(ggml_fp16_t));
+                }
+                io.write(&sgv, sizeof(sgv));
+                io.write(&smv, sizeof(smv));
+                io.write(resid.data(), (size_t) GxC * sizeof(ggml_fp16_t));
+            }
             continue;
         }
 
@@ -2766,11 +2859,11 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         const size_t st_el    = ggml_type_size(GGML_TYPE_I32);  // one int32 per sequence
         io.write_tensor(sz, cr.strm * sz_slab, sz_slab);
         io.write_tensor(gi, cr.strm * gi_slab, gi_slab);
-        // staging indexed by seq_id: per-seq save writes one seq, full save writes all n_seq_max (unified holds
-        // all seqs in stream 0, so cr.strm alone would miss them)
-        const uint32_t seq_off = seq_id >= 0 ? (uint32_t) seq_id : (n_stream == 1 ? 0 : cr.strm);
-        const uint32_t seq_cnt = seq_id >= 0 ? 1                 : (n_stream == 1 ? n_seq_max : 1);
-        // prefix the slab count so the reader knows exactly what was written
+        // virtualized: slabs sized by L and indexed by slot -> save all L; default is sized/indexed by seq
+        const bool     virt    = kpc_virtualized();
+        const uint32_t seq_off = virt ? 0 : (seq_id >= 0 ? (uint32_t) seq_id : (n_stream == 1 ? 0 : cr.strm));
+        const uint32_t seq_cnt = virt ? kpc_staging_slots : (seq_id >= 0 ? 1 : (n_stream == 1 ? n_seq_max : 1));
+        // prefix the slab count so a reader with a different n_seq_max / L reads exactly what was written
         io.write(&seq_cnt, sizeof(seq_cnt));
         io.write_tensor(rs,  seq_off * rs_slab,  seq_cnt * rs_slab);
         io.write_tensor(rsl, seq_off * rsl_slab, seq_cnt * rsl_slab);
@@ -3042,6 +3135,33 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     }
                 }
             }
+            // Restore the OPEN-group staging the save emitted: the EXACT pre-quant f16 residual + staged_group/mask,
+            // so a continuing decode re-seals the partial last group bit-faithfully. resid_slots (cell indices) are
+            // remapped to the dst cells (the restore may land the sequence at different cells than it was saved from).
+            {
+                int32_t sgv = -1, smv = 0;
+                const int64_t GxC = G * C;
+                std::vector<ggml_fp16_t> resid((size_t) GxC, ggml_fp32_to_fp16(0.0f));
+                io.read(&sgv, sizeof(sgv));
+                io.read(&smv, sizeof(smv));
+                io.read(resid.data(), (size_t) GxC * sizeof(ggml_fp16_t));
+                const int slot = kpc_virtualized()
+                    ? (dest_seq_id < (int) kpc_seq2slot.size() ? kpc_seq2slot[dest_seq_id] : -1) : (int) dest_seq_id;
+                if (slot >= 0) {
+                    std::vector<int32_t> rslots(G, 0);
+                    for (int64_t i = 0; i < cell_count; ++i) {     // map each staged within-group slot to its dst cell
+                        const uint32_t idx = sinfo.idxs[0][i];
+                        const int32_t  pos = cells.pos_get(idx);
+                        if (pos / (int32_t) G != sgv) continue;
+                        const int32_t w = pos % (int32_t) G;
+                        if (smv & (1 << w)) rslots[w] = (int32_t) idx;
+                    }
+                    ggml_backend_tensor_set(layer.k_resid,       resid.data(),  (size_t) slot * GxC * sizeof(ggml_fp16_t), (size_t) GxC * sizeof(ggml_fp16_t));
+                    ggml_backend_tensor_set(layer.k_resid_slots, rslots.data(), (size_t) slot * G * sizeof(int32_t),       (size_t) G * sizeof(int32_t));
+                    ggml_backend_tensor_set(layer.staged_group,  &sgv,          (size_t) slot * sizeof(int32_t),           sizeof(int32_t));
+                    ggml_backend_tensor_set(layer.staged_mask,   &smv,          (size_t) slot * sizeof(int32_t),           sizeof(int32_t));
+                }
+            }
             continue;
         }
 
@@ -3197,11 +3317,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const size_t st_el    = ggml_type_size(GGML_TYPE_I32);  // one int32 per sequence
         io.read_tensor(sz, strm * sz_slab, sz_slab);
         io.read_tensor(gi, strm * gi_slab, gi_slab);
-        const uint32_t seq_off = dest_seq_id >= 0 ? (uint32_t) dest_seq_id : (n_stream == 1 ? 0 : strm);
-        // read the recorded slab count, place what fits, discard overflow to keep the stream framed
+        const bool     virt    = kpc_virtualized();
+        const uint32_t seq_off = virt ? 0 : (dest_seq_id >= 0 ? (uint32_t) dest_seq_id : (n_stream == 1 ? 0 : strm));
+        // read the recorded slab count, place what fits (n_seq_max or L), discard overflow to keep the stream framed
         uint32_t n_stage = 0;
         io.read(&n_stage, sizeof(n_stage));
-        const uint32_t cap  = seq_off < n_seq_max ? n_seq_max - seq_off : 0;
+        const uint32_t cap  = virt ? kpc_staging_slots : (seq_off < n_seq_max ? n_seq_max - seq_off : 0);
         const uint32_t fit  = std::min(n_stage, cap);
         const uint32_t over = n_stage - fit;
         std::vector<char> scratch;

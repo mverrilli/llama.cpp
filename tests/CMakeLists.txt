@@ -290,9 +290,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-kpc-virtual.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-virtual PROPERTIES FIXTURES_REQUIRED kpc-model)
 
+    # Test KPC4_1 eager-close: evicting idle seqs on slot pressure (boundary evictions) matches default
+    llama_build_and_test(test-kpc-eager.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-eager PROPERTIES FIXTURES_REQUIRED kpc-model)
+
     # Test KPC4_1 context-shift (RoPE K-shift) on a NON-UNIFIED cache (n_stream>1): stream-aware dequant/requant
     llama_build_and_test(test-kpc-nonunified-shift.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-nonunified-shift PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Test KPC4_1 virtualized-staging ops: seq_cp, whole-cache save/restore, and slot-exhaustion spill
+    llama_build_and_test(test-kpc-virtual-ops.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-virtual-ops PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # Per-sequence state save/restore under virtualized staging (KPC_STAGING_SLOTS<n_seq_max): needs eager-close/spill
+    add_test(NAME test-kpc-state-seq-virt COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-state-seq-virt PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_STAGING_SLOTS=1")
 
     # Test KPC4_1 default-staging seq reuse: full seq_rm after an open group must clear staging
     llama_build_and_test(test-kpc-seq-reuse.cpp LABEL "model" ARGS -m "${KPC_MODEL}")

@@ -266,6 +266,11 @@ private:
     uint32_t                     kpc_staging_slots = 1;        // L
     mutable std::vector<int32_t> kpc_seq2slot;                 // [n_seq_max] seq_id -> slot, -1 = unassigned
     mutable std::vector<char>    kpc_slot_used;                // [L] slot occupancy
+    // eager-close (env, virtualized only): on slot pressure evict an idle seq, freeing its slot and bumping its cursor
+    bool                         kpc_eager_close = false;
+    mutable std::vector<int32_t> kpc_slot2seq;                 // [L] slot -> seq_id, -1 = free (eviction lookup)
+    mutable std::vector<int32_t> kpc_eff_offset;               // [n_seq_max] per-seq logical-group shift
+
     // required padding
     const uint32_t n_pad = 1;
 
@@ -328,13 +333,13 @@ private:
     bool kpc_virtualized() const { return kpc_enabled() && kpc_staging_slots != n_seq_max; }
     // clear a staging slot's open group on all layers
     void kpc_clear_staging_slot(int32_t slot) const;
-    // retire a sequence's staging: clear the open group, release a virtualized slot
+    // retire a sequence's staging: clear the open group, release a virtualized slot, reset the group cursor
     void kpc_retire_seq(llama_seq_id seq_id) const;
     // drop staged members of a sequence's open group with true position in [p0, p1)
     void kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     // mark a freed cell's group_index entry unmapped (-1) on all layers
     void kpc_free_cell(uint32_t strm, uint32_t i) const;
-    // reset all KPC bookkeeping: slot maps, staging, and group_index (-1)
+    // reset all KPC bookkeeping: slot maps, cursors, staging, and group_index (-1)
     void kpc_reset_state() const;
 
     ggml_tensor * build_rope_shift(
