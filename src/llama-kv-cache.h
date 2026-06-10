@@ -249,11 +249,11 @@ private:
         std::vector<ggml_tensor *> v_stream;
 
         ggml_tensor * k_scalezp   = nullptr; // KPC: int8 scale/zp metadata slabs I8 [KPC_SZ_GROUP_BYTES(C), ng_max, n_stream]
-        ggml_tensor * k_resid     = nullptr; // KPC: f16 staging of the open group F16 [n_embd_k_gqa, KPC_GROUP, n_seq_max]
+        ggml_tensor * k_resid     = nullptr; // KPC: f16 staging of the open group F16 [n_embd_k_gqa, KPC_GROUP, L]
         ggml_tensor * group_index = nullptr; // KPC: cell -> scalezp pool index (-1 = free) I32 [kv_size, n_stream]
-        ggml_tensor * k_resid_slots = nullptr; // KPC: physical slot of each staged member I32 [KPC_GROUP, n_seq_max]
-        ggml_tensor * staged_group  = nullptr; // KPC: logical group staged in k_resid, per seq I32 [n_seq_max]
-        ggml_tensor * staged_mask   = nullptr; // KPC: bitmask of staged positions, per seq I32 [n_seq_max]
+        ggml_tensor * k_resid_slots = nullptr; // KPC: physical slot of each staged member I32 [KPC_GROUP, L]
+        ggml_tensor * staged_group  = nullptr; // KPC: logical group staged in k_resid, per slot I32 [L]
+        ggml_tensor * staged_mask   = nullptr; // KPC: bitmask of staged positions, per slot I32 [L]
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -261,6 +261,11 @@ private:
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
+    // open-group staging slot count; default n_seq_max (slot == seq). env KPC_STAGING_SLOTS=L sizes slabs to
+    // L < n_seq_max and maps seq -> a live slot, bounding staging RAM by concurrent sequences
+    uint32_t                     kpc_staging_slots = 1;        // L
+    mutable std::vector<int32_t> kpc_seq2slot;                 // [n_seq_max] seq_id -> slot, -1 = unassigned
+    mutable std::vector<char>    kpc_slot_used;                // [L] slot occupancy
     // required padding
     const uint32_t n_pad = 1;
 
@@ -317,17 +322,19 @@ private:
 
     // KPC lifecycle helpers (no-ops when type_k is not KPC4_1)
     bool kpc_enabled() const { return !layers.empty() && layers[0].k_scalezp; }
-    // staging slab index of a seq (slot == seq)
+    // staging slot of a seq (-1 = none); slot == seq when not virtualized
     int32_t kpc_slot_of(llama_seq_id seq_id) const;
+    // true when staging slots are virtualized (fewer than n_seq_max); valid only after layers are built
+    bool kpc_virtualized() const { return kpc_enabled() && kpc_staging_slots != n_seq_max; }
     // clear a staging slot's open group on all layers
     void kpc_clear_staging_slot(int32_t slot) const;
-    // retire a sequence's staging: clear the open group so a reused seq id starts clean
+    // retire a sequence's staging: clear the open group, release a virtualized slot
     void kpc_retire_seq(llama_seq_id seq_id) const;
     // drop staged members of a sequence's open group with true position in [p0, p1)
     void kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     // mark a freed cell's group_index entry unmapped (-1) on all layers
     void kpc_free_cell(uint32_t strm, uint32_t i) const;
-    // reset all KPC bookkeeping: staging and group_index (-1)
+    // reset all KPC bookkeeping: slot maps, staging, and group_index (-1)
     void kpc_reset_state() const;
 
     ggml_tensor * build_rope_shift(

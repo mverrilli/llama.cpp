@@ -70,7 +70,7 @@ static void build_cache(int64_t C, int64_t kv, int64_t N, const std::vector<int6
             ksd[i] = 0;
             kpd[i] = (int32_t)(head + i);      // true position
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -130,7 +130,7 @@ static void build_cache_scatter(int64_t C, int64_t kv, int64_t N, const std::vec
             ksd[i] = 0;
             kpd[i] = (int32_t)(head + i);              // LOGICAL position
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -594,14 +594,14 @@ static void build_cache_multiseq(int64_t C, int64_t kv, int64_t NS, int64_t npos
                 kcd[ti*C + c] = src_val_seq(sb, c, p);
             }
             idd[ti] = sb*rsize + p;     // disjoint physical slot range per seq (global slot, n_stream=1)
-            ksd[ti] = (int32_t) sb;   // pack slot==seq
+            ksd[ti] = (int32_t)(sb | (sb << GGML_KPC_SLOT_SHIFT));   // pack slot==seq
             kpd[ti] = (int32_t) p;
             ti++;
         }
     }
     GGML_ASSERT(ti == nt);
 
-    struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+    struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, (int32_t) NS);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -661,7 +661,7 @@ static int test_multiseq(int n_threads) {
                 for (int64_t c = 0; c < C; ++c) kcd[p*C + c] = src_val_seq(sb, c, p);
                 idd[p] = p; ksd[p] = 0; kpd[p] = (int32_t) p;
             }
-            struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+            struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
             struct ggml_cgraph * gf = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf, out);
             ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -731,10 +731,10 @@ static int test_contig_batch_steps(int n_threads) {
         for (int64_t sb = 0; sb < NS; ++sb) {
             for (int64_t c = 0; c < C; ++c) kcd[sb*C + c] = src_val_seq(sb, c, p);
             idd[sb] = sb*rsize + p;
-            ksd[sb] = (int32_t) sb;   // pack slot==seq
+            ksd[sb] = (int32_t)(sb | (sb << GGML_KPC_SLOT_SHIFT));   // pack slot==seq
             kpd[sb] = (int32_t) p;
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, (int32_t) NS);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -780,7 +780,7 @@ static int test_contig_batch_steps(int n_threads) {
                 ((int64_t *) id->data)[0] = p;
                 ((int32_t *) ks->data)[0] = 0;
                 ((int32_t *) kp->data)[0] = (int32_t) p;
-                struct ggml_tensor * out = ggml_kpc_write(c2, k2, sz2, rs2, gi2, rsl2, sgp2, smk2, kc, id, ks, kp);
+                struct ggml_tensor * out = ggml_kpc_write(c2, k2, sz2, rs2, gi2, rsl2, sgp2, smk2, kc, id, ks, kp, 1);
                 struct ggml_cgraph * gf = ggml_new_graph(c2);
                 ggml_build_forward_expand(gf, out);
                 ggml_graph_compute_with_ctx(c2, gf, n_threads);
@@ -962,6 +962,69 @@ static int test_rope_shift_multistream(int n_threads) {
     return 1;
 }
 
+// staging-slot virtualization: write NS seqs sequentially, L == NS slots (slot == seq) vs L == 1
+// (each seq reuses slot 0 after the prior retires). cache content is slot-independent -> must be bit-identical
+static int test_virtual_staging(int n_threads) {
+    const int64_t C = 128, kv = 256, NS = 3, P = 40;   // P=40 -> last group (pos 32..39) stays OPEN
+    const int64_t rsize = kv / NS;                     // disjoint physical region per seq
+
+    auto build = [&](int64_t L, std::vector<uint8_t> & kout, std::vector<uint8_t> & szout, std::vector<int32_t> & giout) {
+        struct ggml_init_params ip = { (size_t) 64*1024*1024, NULL, false };
+        struct ggml_context * ctx = ggml_init(ip);
+        const int64_t ng = kv / KPC_GROUP;
+        struct ggml_tensor * k   = ggml_new_tensor_2d(ctx, GGML_TYPE_KPC4_1, C, kv);
+        struct ggml_tensor * sz  = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(C), ng);
+        struct ggml_tensor * gi  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
+        struct ggml_tensor * rs  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, C, KPC_GROUP, L);
+        struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, L);
+        struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+        struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+        memset(k->data, 0, ggml_nbytes(k));     memset(sz->data, 0, ggml_nbytes(sz));   memset(gi->data, 0xFF, ggml_nbytes(gi));
+        memset(rs->data, 0, ggml_nbytes(rs));   memset(rsl->data, 0, ggml_nbytes(rsl));
+        memset(sgp->data, 0, ggml_nbytes(sgp)); memset(smk->data, 0, ggml_nbytes(smk));
+
+        for (int64_t sb = 0; sb < NS; ++sb) {
+            const int64_t slot = (L == NS) ? sb : 0;   // identity slots vs reuse-one-slot
+            struct ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, P);
+            struct ggml_tensor * id = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, P);
+            struct ggml_tensor * ks = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, P);
+            struct ggml_tensor * kp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, P);
+            float   * kcd = (float   *) kc->data;
+            int64_t * idd = (int64_t *) id->data;
+            int32_t * ksd = (int32_t *) ks->data;
+            int32_t * kpd = (int32_t *) kp->data;
+            for (int64_t i = 0; i < P; ++i) {
+                for (int64_t c = 0; c < C; ++c) kcd[i*C + c] = src_val_seq(sb, c, i);
+                idd[i] = sb*rsize + i;                          // disjoint physical slots per seq
+                ksd[i] = (int32_t)(sb | (slot << GGML_KPC_SLOT_SHIFT));          // pack staging slot in high bits
+                kpd[i] = (int32_t) i;
+            }
+            struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, (int32_t) NS);
+            struct ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, out);
+            ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+            if (L == 1) {
+                ((int32_t *) smk->data)[0] = 0;
+                ((int32_t *) sgp->data)[0] = 0;
+            }
+        }
+        kout.resize(ggml_nbytes(k));        memcpy(kout.data(),  k->data,  ggml_nbytes(k));
+        szout.resize(ggml_nelements(sz));   memcpy(szout.data(), sz->data, ggml_nbytes(sz));
+        giout.resize(ggml_nelements(gi));   memcpy(giout.data(), gi->data, ggml_nbytes(gi));
+        ggml_free(ctx);
+    };
+
+    std::vector<uint8_t> k2, k1;  std::vector<uint8_t> s2, s1;  std::vector<int32_t> g2, g1;
+    build(NS, k2, s2, g2);   // reference: L == NS, slot == seq
+    build(1,  k1, s1, g1);
+
+    bool ok = (k1 == k2) && (g1 == g2) && (s1.size() == s2.size());
+    if (ok) { for (size_t i = 0; i < s1.size(); ++i) if (s1[i] != s2[i]) { ok = false; break; } }
+    printf("%s virtual-staging: %lld seqs in L=1 staging slot reuse == L=%lld bit-identical cache\n",
+           ok ? "PASS" : "FAIL", (long long) NS, (long long) NS);
+    return ok ? 0 : 1;
+}
+
 // pool re-encode rescue: continuing a group after its staging was dropped must requant prior
 // members from int4 against the new joint scale, not leave them on the overwritten scale
 static int test_rescue(int n_threads) {
@@ -994,7 +1057,7 @@ static int test_rescue(int n_threads) {
             ((int32_t *) ks->data)[i] = 0;
             ((int32_t *) kp->data)[i] = (int32_t)(p0 + i);
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -1169,13 +1232,16 @@ int main() {
     // 9. continuous-batch per-step writes: each live group keeps its own scales
     failures += test_contig_batch_steps(nt);
 
-    // 10. RoPE K-shift chain (context-shift): dequant -> rope -> kpc_requant dequants to the rope'd reference
+    // 10. staging-slot virtualization: slot reuse across retired seqs -> bit-identical cache
+    failures += test_virtual_staging(nt);
+
+    // 11. RoPE K-shift chain: dequant -> rope -> kpc_requant matches the rope'd reference
     failures += test_rope_shift(nt);
 
-    // 11. RoPE K-shift, non-unified (multi-stream): each stream bit-matches an independent single-stream shift
+    // 12. multi-stream RoPE K-shift: each stream bit-matches a single-stream shift
     failures += test_rope_shift_multistream(nt);
 
-    // 12. pool re-encode rescue: continuing a group after its staging was dropped keeps the prior members
+    // 13. pool re-encode rescue: group continued after staging drop keeps prior members
     failures += test_rescue(nt);
 
     // 14. GQA grouping: grouped sibling-head walk is bit-identical to per-head execution

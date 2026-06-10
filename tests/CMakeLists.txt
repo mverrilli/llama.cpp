@@ -286,11 +286,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     add_test(NAME test-kpc-state-seq-nonunified-raw COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-state-seq-nonunified-raw PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_TEST_NONUNIFIED=1;KPC_SEQ_RAW=1")
 
+    # Test KPC4_1 staging-slot virtualization (KPC_STAGING_SLOTS<n_seq_max) matches the default bit-for-bit
+    llama_build_and_test(test-kpc-virtual.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-virtual PROPERTIES FIXTURES_REQUIRED kpc-model)
+
     # Test KPC4_1 context-shift (RoPE K-shift) on a NON-UNIFIED cache (n_stream>1): stream-aware dequant/requant
     llama_build_and_test(test-kpc-nonunified-shift.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-nonunified-shift PROPERTIES FIXTURES_REQUIRED kpc-model)
 
-    # Test KPC4_1 staging lifecycle: seq_rm/seq_keep/clear retire or trim the open-group staging
+    # Test KPC4_1 default-staging seq reuse: full seq_rm after an open group must clear staging
     llama_build_and_test(test-kpc-seq-reuse.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-seq-reuse PROPERTIES FIXTURES_REQUIRED kpc-model)
 

@@ -149,6 +149,18 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
+    // staging-slot count L; default L == n_seq_max (slot == seq). env KPC_STAGING_SLOTS=L (clamped [1,n_seq_max])
+    // sizes the staging slabs to L and maps seq -> a live slot, bounding staging RAM by concurrent sequences
+    kpc_staging_slots = n_seq_max;
+    if (const char * e = getenv("KPC_STAGING_SLOTS")) {
+        const long v = atol(e);
+        if (v >= 1 && v < (long) n_seq_max) {
+            kpc_staging_slots = (uint32_t) v;
+        }
+    }
+    kpc_seq2slot.assign(n_seq_max, -1);
+    kpc_slot_used.assign(kpc_staging_slots, 0);
+
     if (type_k == GGML_TYPE_KPC4_1) {
         // each of the n_seqps sequences sharing a stream needs at least one scalezp pool in its band
         const uint32_t ng_max  = (kv_size + KPC_GROUP - 1) / KPC_GROUP;
@@ -273,15 +285,15 @@ llama_kv_cache::llama_kv_cache(
             // scalezp/group_index indexed per stream (ng_max pool banded per seq); staging sized by n_seq_max
             k_scalezp = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(n_embd_k_gqa), ng_max, n_stream);
             ggml_format_name(k_scalezp, "cache_k_scalezp_l%d", il);
-            k_resid = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, KPC_GROUP, n_seq_max);
+            k_resid = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, KPC_GROUP, kpc_staging_slots);
             ggml_format_name(k_resid, "cache_k_resid_l%d", il);
             group_index = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv_size, n_stream);
             ggml_format_name(group_index, "cache_k_gidx_l%d", il);
-            k_resid_slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, n_seq_max);
+            k_resid_slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, kpc_staging_slots);
             ggml_format_name(k_resid_slots, "cache_k_resid_slots_l%d", il);
-            staged_group = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq_max);
+            staged_group = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kpc_staging_slots);
             ggml_format_name(staged_group, "cache_k_staged_group_l%d", il);
-            staged_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq_max);
+            staged_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kpc_staging_slots);
             ggml_format_name(staged_mask, "cache_k_staged_mask_l%d", il);
         }
 
@@ -541,7 +553,7 @@ int32_t llama_kv_cache::kpc_staged_mask(uint32_t il, int32_t slot) const {
 }
 
 int32_t llama_kv_cache::kpc_slot_of(llama_seq_id seq_id) const {
-    return (int32_t) seq_id;
+    return kpc_virtualized() ? kpc_seq2slot[seq_id] : (int32_t) seq_id;
 }
 
 void llama_kv_cache::kpc_clear_staging_slot(int32_t slot) const {
@@ -558,7 +570,12 @@ void llama_kv_cache::kpc_retire_seq(llama_seq_id seq_id) const {
     if (!kpc_enabled()) {
         return;
     }
-    kpc_clear_staging_slot(kpc_slot_of(seq_id));
+    const int32_t slot = kpc_slot_of(seq_id);
+    if (kpc_virtualized() && slot >= 0) {
+        kpc_slot_used[slot]  = 0;
+        kpc_seq2slot[seq_id] = -1;
+    }
+    kpc_clear_staging_slot(slot);
 }
 
 void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -599,6 +616,8 @@ void llama_kv_cache::kpc_free_cell(uint32_t strm, uint32_t i) const {
 }
 
 void llama_kv_cache::kpc_reset_state() const {
+    std::fill(kpc_seq2slot.begin(),  kpc_seq2slot.end(),  -1);
+    std::fill(kpc_slot_used.begin(), kpc_slot_used.end(),  0);
     if (!kpc_enabled()) {
         return;
     }
@@ -620,6 +639,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+
+    const bool kpc_virtualized = kpc_staging_slots != n_seq_max && !layers.empty() && layers[0].k_scalezp;
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
@@ -660,6 +681,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     }
 
     // cross-stream sequence copies require to copy the actual buffer data
+    if (kpc_virtualized) {
+        // cross-stream + virtualized would need slot remapping across streams; unsupported
+        throw std::runtime_error("KPC4_1 cross-stream seq_cp is unsupported with virtualized staging on a non-unified cache");
+    }
 
     bool is_full = true;
 
@@ -1538,7 +1563,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         GGML_ASSERT(kpc_seq && kpc_pos && "KPC write needs kpc_seq/kpc_pos inputs");
         return ggml_kpc_write(ctx, k, layers[ikv].k_scalezp, layers[ikv].k_resid, layers[ikv].group_index,
                                    layers[ikv].k_resid_slots, layers[ikv].staged_group, layers[ikv].staged_mask,
-                                   k_cur, k_idxs, kpc_seq, kpc_pos);
+                                   k_cur, k_idxs, kpc_seq, kpc_pos, (int32_t) n_seq_max);
     }
 
     if (n_stream > 1) {
@@ -1715,7 +1740,10 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
     int32_t * seq_data = (int32_t *) seq->data;
     int32_t * pos_data = (int32_t *) pos->data;
 
-    // same token ordering as set_input_k_idxs (ti = s*size + i) so kpc_seq / kpc_pos / k_idxs index-align
+    const bool virtualized = kpc_virtualized();
+
+    // same token ordering as set_input_k_idxs (ti = s*size + i) so kpc_seq/kpc_pos/k_idxs index-align.
+    // kpc_seq packs staging slot in high bits, seq_id in low bits (slot==seq when not virtualized)
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             const uint32_t ti = s*sinfo.size() + i;
@@ -1723,7 +1751,26 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
             const llama_seq_id sb = ubatch->seq_id[ti][0];   // primary seq for the (seq,group) pool
             GGML_ASSERT(sb >= 0 && sb < (int) n_seq_max);
 
-            seq_data[ti] = sb;
+            int32_t slot = sb;
+            if (virtualized) {
+                slot = kpc_seq2slot[sb];
+                if (slot < 0) {   // first write for this seq -> claim a free staging slot
+                    for (uint32_t c = 0; c < kpc_staging_slots; ++c) {
+                        if (!kpc_slot_used[c]) { slot = (int32_t) c; break; }
+                    }
+                    if (slot < 0) {
+                        throw std::runtime_error("KPC staging slots exhausted (KPC_STAGING_SLOTS=" +
+                            std::to_string(kpc_staging_slots) + "): more concurrent sequences than slots; "
+                            "raise KPC_STAGING_SLOTS or reduce parallelism");
+                    }
+                    kpc_seq2slot[sb]    = slot;
+                    kpc_slot_used[slot] = 1;
+                    // reused slot may carry a prior seq's abandoned open group -> clear it
+                    kpc_clear_staging_slot(slot);
+                }
+            }
+
+            seq_data[ti] = sb | (slot << KPC_SLOT_SHIFT);
             pos_data[ti] = ubatch->pos[ti];
         }
     }
@@ -1817,7 +1864,7 @@ void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
         }
     }
 
-    for (uint32_t slot = 0; slot < n_seq_max; ++slot) {
+    for (uint32_t slot = 0; slot < kpc_staging_slots; ++slot) {
         kpc_clear_staging_slot((int32_t) slot);
     }
 }
@@ -2322,12 +2369,18 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
     // per-sequence KPC4_1 save (host path): the K is emitted as dequantized f16 in state_write_data and the
     // shared scalezp pools / group_index are NOT serialized; restore re-quantizes inline (see state_read_data).
+    // prototype limitation: the seq->staging-slot map is not (yet) serialized, so virtualized staging cannot
+    // round-trip through save/restore. The default (KPC_STAGING_SLOTS == n_seq_max) path is fully supported.
+    if (kpc_enabled() && kpc_staging_slots != n_seq_max) {
+        throw std::runtime_error("KPC4_1 state save/restore is unsupported with virtualized staging (KPC_STAGING_SLOTS < n_seq_max)");
+    }
 
     io.write(&n_stream, sizeof(n_stream));
 
-    // KPC slab framing and pool-band layout depend on this; a mismatched reader must refuse
+    // KPC slab framing and pool-band layout depend on these; a mismatched reader must refuse
     if (kpc_enabled()) {
-        io.write(&n_seq_max, sizeof(n_seq_max));
+        const uint32_t kpc_cfg[2] = { n_seq_max, kpc_staging_slots };
+        io.write(kpc_cfg, sizeof(kpc_cfg));
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2401,6 +2454,10 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("KPC4_1 KV cache does not support on-device sequence state; use the host path (flags=0)");
     }
     // per-sequence KPC4_1 restore (host path) is supported: state_read_data re-quantizes the f16 K inline.
+    // mirror of state_write: virtualized staging does not round-trip yet
+    if (kpc_enabled() && kpc_staging_slots != n_seq_max) {
+        throw std::runtime_error("KPC4_1 state save/restore is unsupported with virtualized staging (KPC_STAGING_SLOTS < n_seq_max)");
+    }
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -2410,15 +2467,15 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("n_stream mismatch");
     }
 
-    // the stored group_index pool ids and staging slabs were laid out under this; refuse a mismatch
+    // the stored group_index pool ids and staging slabs were laid out under these; refuse a mismatch
     // instead of silently decoding old cells against wrong pool bands
     if (kpc_enabled()) {
-        uint32_t n_seq_max_cur = 0;
-        io.read(&n_seq_max_cur, sizeof(n_seq_max_cur));
-        if (n_seq_max_cur != n_seq_max) {
+        uint32_t kpc_cfg[2] = { 0, 0 };
+        io.read(kpc_cfg, sizeof(kpc_cfg));
+        if (kpc_cfg[0] != n_seq_max || kpc_cfg[1] != kpc_staging_slots) {
             throw std::runtime_error(format(
-                "KPC4_1 state was saved with n_seq_max=%u but this context has %u; "
-                "restore requires a matching configuration", n_seq_max_cur, n_seq_max));
+                "KPC4_1 state was saved with n_seq_max=%u, staging slots=%u but this context has %u/%u; "
+                "restore requires a matching configuration", kpc_cfg[0], kpc_cfg[1], n_seq_max, kpc_staging_slots));
         }
     }
 

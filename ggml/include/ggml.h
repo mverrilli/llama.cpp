@@ -2424,10 +2424,11 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    // KPC wire format, shared by the kernels, the llama KV cache and the tests:
-    // token group size and the int8 scalezp slab size per group
-    // (slab layout: [fp16 super_scale_s][fp16 zp_min][fp16 super_scale_z][C x u8 q_s][C x u8 q_z])
+    // KPC wire format, shared by the kernels, the llama KV cache and the tests
+    // scalezp slab per group: [fp16 super_scale_s][fp16 zp_min][fp16 super_scale_z][C x u8 q_s][C x u8 q_z]
 #define GGML_KPC_GROUP        32
+#define GGML_KPC_SLOT_SHIFT   16
+#define GGML_KPC_SEQ_MASK     ((1 << GGML_KPC_SLOT_SHIFT) - 1)
 #define GGML_KPC_SZ_GROUP_BYTES(C) (2*(int64_t)(C) + 6)
 
     // group_index (optional, I32): per-slot scalezp pool index, NULL -> contiguous; -1 entries = free cells
@@ -2466,7 +2467,8 @@ extern "C" {
             struct ggml_tensor  * k_cur,
             struct ggml_tensor  * k_idxs,
             struct ggml_tensor  * kpc_seq,
-            struct ggml_tensor  * kpc_pos);
+            struct ggml_tensor  * kpc_pos,
+            int32_t               n_seq_max);
 
     // re-quantize roped f32 K back into the packed int4 cache + scalezp, keeping group_index (used by the KPC RoPE K-shift)
     GGML_API struct ggml_tensor * ggml_kpc_requant(

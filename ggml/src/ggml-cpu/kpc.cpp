@@ -10,7 +10,9 @@
 #include <vector>
 
 // wire-format constants are shared via ggml.h (GGML_KPC_*); local aliases keep the kernel code short
-#define KPC_GROUP GGML_KPC_GROUP   // token group size
+#define KPC_GROUP      GGML_KPC_GROUP        // token group size
+#define KPC_SLOT_SHIFT GGML_KPC_SLOT_SHIFT   // kpc_seq packs staging slot in high bits, seq_id in low bits
+#define KPC_SEQ_MASK   GGML_KPC_SEQ_MASK
 static_assert(KPC_GROUP <= 32, "open-group members bitmask is uint32_t");
 
 #define KPC_F16_NEG_INF ((ggml_fp16_t) 0xFC00)   // the unique fp16 encoding of -INFINITY (mask sentinel)
@@ -813,15 +815,9 @@ void ggml_compute_forward_kpc_flash_attn(const struct ggml_compute_params * para
     #undef KPC_GQA_MAX
 }
 
-// in-place per-channel int4 K write. groups by logical position (pos/32, per token via kpc_seq/kpc_pos) and
-// scatters each cell to the physical slot from k_idxs, so SWA/defrag-recycled slots work. each (seq,group)
-// maps to its own scalezp pool, so each sequence's scales stay independent. for each (seq,group):
-// members = this call's tokens ++ (if the seq's open group) its staged f16 originals (k_resid); per-channel
-// scale/zp -> packed nibbles; scalezp[pool] and group_index[slot] = pool. only the highest group per seq
-// stays open. writes dst/scalezp/k_resid/group_index and the staging state in place; work is split into
-// (seq, pool) items so a pool slab and its cells are owned by one thread, with the staging update deferred
-// past a barrier (phase 2) so the per-call staging reads stay race-free.
-// op_params unused; n_tokens/kv_size/ng_max/n_seq_max come from the src tensor shapes.
+// in-place per-channel int4 K write: tokens group by logical pos/32 per seq and scatter to the
+// k_idxs slots; each (seq,group) owns a scalezp pool, with members incl. the seq's staged f16
+// originals (k_resid). work is split into (seq,pool) items, staging updated after a barrier.
 void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * kc  = dst->src[0];   // k_cur   f32 [C, n_tokens] (stream-ordered)
     struct ggml_tensor       * sz  = dst->src[1];   // scalezp F16 [2C, ng_max, n_stream]  (in-place)
@@ -834,12 +830,16 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
     const int32_t            * kpc_seq = (const int32_t *) dst->src[8]->data;   // primary seq per token I32 [n_tokens]
     const int32_t            * kpc_pos = (const int32_t *) dst->src[9]->data;   // true position per token I32 [n_tokens]
 
-    // n_seqps sequences share one stream; each owns a band_size scalezp pool band so they never collide.
-    // the staging slabs are sized per sequence (staged_group->ne[0] == n_seq_max)
+    int32_t pr[16];
+    memcpy(pr, dst->op_params, sizeof(pr));
+
+    // each of the n_seqps sequences sharing a stream owns a band_size scalezp pool band;
+    // L = staging-slot count (L < n_seq_max when virtualized)
     const int64_t   kv_size   = dst->ne[1];
     const int64_t   ng_max    = sz->ne[1];
     const int64_t   n_stream  = dst->src[1]->ne[2];
-    const int64_t   n_seq_max = dst->src[6]->ne[0];
+    const int64_t   n_seq_max = pr[0];
+    const int64_t   L         = dst->src[6]->ne[0];
     GGML_ASSERT(n_stream >= 1 && n_seq_max >= n_stream);
     const int64_t   n_seqps   = n_seq_max / n_stream;
     GGML_ASSERT(n_seqps >= 1);
@@ -863,10 +863,13 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
 
     const uint32_t full_mask = G >= 32 ? 0xFFFFFFFFu : ((1u << (uint32_t) G) - 1u);
 
-    // every token's primary seq must fit the staging / pool-band sizing (the host enforces this too)
+    // every token's seq must fit the band namespace and its packed slot must fit the staging slots (host enforces too)
     if (ith == 0) {
         for (int64_t t = 0; t < n_tokens; ++t) {
-            GGML_ASSERT(kpc_seq[t] >= 0 && kpc_seq[t] < n_seq_max && "KPC write: seq_id out of range");
+            const int64_t seq  = kpc_seq[t] & KPC_SEQ_MASK;
+            const int64_t slot = (int64_t)(uint32_t) kpc_seq[t] >> KPC_SLOT_SHIFT;
+            GGML_ASSERT(seq  >= 0 && seq  < n_seq_max && "KPC write: seq_id out of range");
+            GGML_ASSERT(slot >= 0 && slot < L         && "KPC write: staging slot out of range");
         }
     }
 
@@ -874,11 +877,13 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
     // grouped by (seq, pool) and round-robined; built identically on every thread.
     std::vector<int64_t> seq_lo((size_t) n_seq_max, INT64_MAX);
     std::vector<int64_t> seq_hi((size_t) n_seq_max, -1);
+    std::vector<int64_t> seq_slot((size_t) n_seq_max, -1);
     std::vector<std::pair<int64_t, int64_t>> work;   // (seq, lg)
     work.reserve((size_t) n_tokens);
     for (int64_t t = 0; t < n_tokens; ++t) {
-        const int64_t sb = kpc_seq[t];
+        const int64_t sb = kpc_seq[t] & KPC_SEQ_MASK;
         const int64_t lg = (int64_t) kpc_pos[t] / G;
+        seq_slot[sb] = (int64_t)(uint32_t) kpc_seq[t] >> KPC_SLOT_SHIFT;   // same for all of sb's tokens
         if (lg < seq_lo[sb]) seq_lo[sb] = lg;
         if (lg > seq_hi[sb]) seq_hi[sb] = lg;
         work.emplace_back(sb, lg);
@@ -887,8 +892,9 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
         if (seq_hi[sb] < 0) {
             continue;
         }
-        if (smk[sb] != 0 && sgp[sb] >= seq_lo[sb] && sgp[sb] <= seq_hi[sb]) {
-            work.emplace_back(sb, (int64_t) sgp[sb]);
+        const int64_t slot = seq_slot[sb];
+        if (smk[slot] != 0 && sgp[slot] >= seq_lo[sb] && sgp[slot] <= seq_hi[sb]) {
+            work.emplace_back(sb, (int64_t) sgp[slot]);
         }
     }
     auto pool_of = [&](int64_t sb, int64_t lg) -> int64_t {
@@ -916,11 +922,11 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
     // and its physical slot. folds the staged open-group cells when lg is the staged group.
     int64_t tok_of[32];    // G <= 32
     int64_t slot_of[32];
-    auto gather = [&](int64_t sb, int64_t lg) -> uint32_t {
+    auto gather = [&](int64_t sb, int64_t lg, int64_t slot) -> uint32_t {
         for (int64_t w = 0; w < G; ++w) { tok_of[w] = -1; slot_of[w] = -1; }
         uint32_t members = 0;
         for (int64_t t = 0; t < n_tokens; ++t) {
-            if ((int64_t) kpc_seq[t] != sb) continue;
+            if (((int64_t) kpc_seq[t] & KPC_SEQ_MASK) != sb) continue;
             const int64_t p = (int64_t) kpc_pos[t];
             if (p / G != lg) continue;
             const int64_t w = p % G;
@@ -928,12 +934,12 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
             tok_of[w] = t;
             slot_of[w] = idxd[t] % kv_size;   // k_idxs is global slot incl stream offset
         }
-        if (lg == sgp[sb]) {
-            const uint32_t prev_mask = (uint32_t) smk[sb];
+        if (lg == sgp[slot]) {
+            const uint32_t prev_mask = (uint32_t) smk[slot];
             for (int64_t w = 0; w < G; ++w) {
                 if ((prev_mask & (1u << w)) && !(members & (1u << w))) {
                     members  |= (1u << w);
-                    slot_of[w] = rsl[sb*G + w];   // staged slot
+                    slot_of[w] = rsl[slot*G + w];   // staged slot
                 }
             }
         }
@@ -955,7 +961,8 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
 
         const int64_t s     = sb / n_seqps;                  // physical stream
         const int64_t sbase = s * sz->nb[2];                 // scalezp stream slab (byte offset)
-        const int64_t rbase = sb * (C*G);                    // k_resid per-sequence slab (f16 elems)
+        const int64_t slot  = seq_slot[sb];
+        const int64_t rbase = slot * (C*G);                  // k_resid staging slab (f16 elems)
 
         // original of a member at within-pos w: f32 from k_cur token tk (>=0) else f16 from staged k_resid
         auto orig = [&](int64_t tk, int64_t w, int64_t c) -> float {
@@ -965,7 +972,7 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
             return GGML_CPU_FP16_TO_FP32(rsd[rbase + w*C + c]);
         };
 
-        const uint32_t members = gather(sb, lg);
+        const uint32_t members = gather(sb, lg, slot);
         if (members == 0) {
             continue;   // fold-only entry whose staging emptied: nothing to write
         }
@@ -1075,7 +1082,7 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
 
     ggml_barrier(params->threadpool);
 
-    // phase 2: staging update. only the highest group of a seq stays open; re-stage its members
+    // phase 2: staging update. only the highest group of a staged seq stays open; re-stage its members
     // (f16 originals + slots) for the next call, or mark it complete. runs after the barrier so phase 1
     // folds everywhere saw the pre-call staging.
     item = -1; prev_sb = -1; prev_pool = -1;
@@ -1087,17 +1094,18 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
         if ((int) (item % nth) != ith) {
             continue;
         }
+        const int64_t slot = seq_slot[sb];
         if (lg != seq_hi[sb]) {
             continue;
         }
 
-        const int64_t rbase  = sb * (C*G);
-        const int64_t slbase = sb * G;
-        const uint32_t members = gather(sb, lg);     // old smk/sgp still intact here
+        const int64_t rbase  = slot * (C*G);
+        const int64_t slbase = slot * G;
+        const uint32_t members = gather(sb, lg, slot);   // old smk/sgp still intact here
 
         if (members == full_mask) {                  // group complete
-            sgp[sb] = (int32_t) lg;
-            smk[sb] = 0;
+            sgp[slot] = (int32_t) lg;
+            smk[slot] = 0;
         } else {
             for (int64_t w = 0; w < G; ++w) {
                 if (!(members & (1u << w))) continue;
@@ -1108,8 +1116,8 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
                     rsd[rbase + w*C + c] = GGML_CPU_FP32_TO_FP16(o);
                 }
             }
-            sgp[sb] = (int32_t) lg;
-            smk[sb] = (int32_t) members;
+            sgp[slot] = (int32_t) lg;
+            smk[slot] = (int32_t) members;
         }
     }
 }

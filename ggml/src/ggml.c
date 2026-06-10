@@ -5485,15 +5485,16 @@ struct ggml_tensor * ggml_kpc_write(
         struct ggml_tensor  * k_cur,
         struct ggml_tensor  * k_idxs,
         struct ggml_tensor  * kpc_seq,
-        struct ggml_tensor  * kpc_pos) {
+        struct ggml_tensor  * kpc_pos,
+        int32_t               n_seq_max) {
     struct ggml_tensor * result = ggml_view_tensor(ctx, k);   // alias-write in place
 
     GGML_ASSERT(kpc_seq->type == GGML_TYPE_I32 && kpc_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(kpc_seq->ne[0] == k_cur->ne[1] && kpc_pos->ne[0] == kpc_seq->ne[0]);
 
-    // op_params unused: n_tokens/kv_size/ng_max/n_seq_max all come from the src tensor shapes;
-    // zero-init for the kernel's fixed memcpy
-    int32_t params[16] = { 0 };
+    // op_params: { n_seq_max } (the band namespace, separate from staged_group->ne[0] = staging-slot count L).
+    // n_tokens/kv_size/ng_max come from the src tensor shapes; zero-init for the fixed memcpy
+    int32_t params[16] = { n_seq_max };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_KPC_WRITE;
