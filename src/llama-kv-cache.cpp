@@ -2732,9 +2732,23 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const size_t  sz_stream = ggml_nbytes(sz) / sz->ne[2];   // per-stream slab bytes
             const int64_t ng_max    = sz->ne[1];
             const int64_t szgb      = GGML_KPC_SZ_GROUP_BYTES(C);
-            const uint8_t * kd  = (const uint8_t *) k->data;
+            // K and scalezp may be device-resident (KPC CUDA); group_index is always host. Stage the device
+            // tensors into host buffers so the per-cell reads below work for both host and offloaded caches.
+            std::vector<uint8_t> k_host, sz_host;
+            const uint8_t * kd;
+            const uint8_t * szd;
+            if (ggml_backend_buffer_is_host(k->buffer)) {
+                kd  = (const uint8_t *) k->data;
+                szd = (const uint8_t *) sz->data + (size_t) cr.strm * sz_stream;
+            } else {
+                k_host.resize(ggml_nbytes(k));
+                ggml_backend_tensor_get(k, k_host.data(), 0, ggml_nbytes(k));
+                kd = k_host.data();
+                sz_host.resize(sz_stream);
+                ggml_backend_tensor_get(sz, sz_host.data(), (size_t) cr.strm * sz_stream, sz_stream);
+                szd = sz_host.data();
+            }
             const int32_t * gid = (const int32_t *) gi->data + (size_t) cr.strm * gi->ne[0];
-            const uint8_t * szd = (const uint8_t *) sz->data + (size_t) cr.strm * sz_stream;
 
             // cells in token order (cr.data is sorted by cell index = token order for a contiguous seq)
             std::vector<uint32_t> ord;
@@ -3084,9 +3098,24 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             const int64_t n_seqps   = (int64_t) n_seq_max / (int64_t) n_stream;
             const int64_t band_size = ng_max / n_seqps;
             const int64_t G         = GGML_KPC_GROUP;
-            uint8_t * kd  = (uint8_t *) k->data;
+            // K and scalezp may be device-resident (KPC CUDA); stage into host buffers, re-quantize there, and
+            // write the whole stream slabs back to the device at the end. group_index is always host.
+            const bool kdev = !ggml_backend_buffer_is_host(k->buffer);
+            std::vector<uint8_t> k_host, sz_host;
+            uint8_t * kd;
+            uint8_t * szd;
+            if (kdev) {
+                k_host.resize(ggml_nbytes(k));
+                ggml_backend_tensor_get(k, k_host.data(), 0, ggml_nbytes(k));
+                kd = k_host.data();
+                sz_host.resize(sz_stream);
+                ggml_backend_tensor_get(sz, sz_host.data(), (size_t) strm * sz_stream, sz_stream);
+                szd = sz_host.data();
+            } else {
+                kd  = (uint8_t *) k->data;
+                szd = (uint8_t *) sz->data + (size_t) strm * sz_stream;
+            }
             int32_t * gid = (int32_t *) gi->data + (size_t) strm * gi->ne[0];
-            uint8_t * szd = (uint8_t *) sz->data + (size_t) strm * sz_stream;
             const int64_t n_groups = ((int64_t) cell_count + G - 1) / G;
 
             std::vector<float> scale(C), zp(C), nsc(C), nzp(C);
@@ -3171,6 +3200,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         return false;
                     }
                 }
+            }
+            if (kdev) {   // flush the re-quantized K + scalezp back to the device cache
+                ggml_backend_tensor_set(k, k_host.data(), 0, ggml_nbytes(k));
+                ggml_backend_tensor_set(sz, sz_host.data(), (size_t) strm * sz_stream, sz_stream);
             }
             // Restore the OPEN-group staging the save emitted: the EXACT pre-quant f16 residual + staged_group/mask,
             // so a continuing decode re-seals the partial last group bit-faithfully. resid_slots (cell indices) are
