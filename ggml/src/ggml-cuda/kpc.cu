@@ -94,12 +94,13 @@ static __global__ void kpc_flash_decode_kernel(
         int64_t sz_nb1, int64_t sz_nb2,
         int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
         int64_t m_nb1, int64_t m_nb2, int64_t m_nb3, int m_ne2, int m_ne3,
-        int64_t dst_nb1, int dst_ne1, int dst_ne2) {
+        int64_t dst_nb1, int dst_ne1, int dst_ne2, int n_split) {
     const int iq2 = blockIdx.x;   // query head
     const int iq1 = blockIdx.y;   // query position
     const int iq3 = blockIdx.z;   // stream
     if (iq2 >= n_head || iq1 >= n_q || iq3 >= n_stream) return;
-    const int lane = threadIdx.x;                            // one warp (32 lanes) per (head, query, stream)
+    const int wid  = threadIdx.x >> 5;                       // warp = key-split partition (split-K)
+    const int lane = threadIdx.x & 31;                       // n_split warps per (head, query, stream)
 
     const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
     const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
@@ -123,7 +124,7 @@ static __global__ void kpc_flash_decode_kernel(
     for (int j = 0; j < ndv; ++j) acc[j] = 0.0f;
     float m = -INFINITY, l = 0.0f;
 
-    for (int t = 0; t < n_kv; ++t) {
+    for (int t = wid; t < n_kv; t += n_split) {              // split-K: warp wid owns keys {wid, wid+n_split, ...}
         const float mv = mp ? __half2float(mp[t]) : 0.0f;
         if (mp && mv == -INFINITY) continue;                 // same for every lane -> no warp divergence
         int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
@@ -163,16 +164,42 @@ static __global__ void kpc_flash_decode_kernel(
         }
         m = mn;
     }
-    if (sinks) {                                                    // attention sink: fold sink logit into denom
+    // attention sink: fold the per-head sink logit into the denominator once (on warp 0 only, so it is
+    // counted a single time across the split). No V contribution.
+    if (sinks && wid == 0) {
         const float sk = sinks[iq2];
         const float mn = fmaxf(m, sk), a = expf(m - mn), p = expf(sk - mn);
         l = l * a + p;
         for (int j = 0; j < ndv; ++j) acc[j] *= a;
         m = mn;
     }
-    const float Sinv = (l == 0.0f) ? 0.0f : 1.0f / l;
+
     float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
-    for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[j] * Sinv; }
+    if (n_split == 1) {                                             // single warp -> emit directly, no reduction
+        const float Sinv = (l == 0.0f) ? 0.0f : 1.0f / l;
+        for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[j] * Sinv; }
+        return;
+    }
+
+    // split-K reduction: combine the per-warp (m, l, VKQ) partials with an online-softmax rescale.
+    extern __shared__ float smem[];
+    float * s_acc = smem;                  // [n_split][DV]
+    float * s_m   = smem + (size_t) n_split * DV;
+    float * s_l   = s_m + n_split;
+    for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) s_acc[(size_t) wid * DV + d] = acc[j]; }
+    if (lane == 0) { s_m[wid] = m; s_l[wid] = l; }
+    __syncthreads();
+
+    float m_g = -INFINITY;
+    for (int w = 0; w < n_split; ++w) m_g = fmaxf(m_g, s_m[w]);
+    float l_g = 0.0f;
+    for (int w = 0; w < n_split; ++w) l_g += (s_m[w] == -INFINITY) ? 0.0f : s_l[w] * expf(s_m[w] - m_g);
+    const float Sinv = (l_g == 0.0f) ? 0.0f : 1.0f / l_g;
+    for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+        float a = 0.0f;
+        for (int w = 0; w < n_split; ++w) a += (s_m[w] == -INFINITY) ? 0.0f : s_acc[(size_t) w * DV + d] * expf(s_m[w] - m_g);
+        out[d] = a * Sinv;
+    }
 }
 
 // ---- host wrappers (thin launchers; exercised once M3 wires the GPU-native tensors) ----
@@ -201,8 +228,15 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool v_q41 = V->type == GGML_TYPE_Q4_1;
 
     const int gi_stride = gi ? (int) (gi->nb[1] / sizeof(int32_t)) : 0;   // per-stream stride (= kv_size)
+    // split-K: when there are few query blocks (decode), split the key loop across warps so the GPU stays
+    // busy; prefill already has enough (head x query) blocks, so it stays at 1 warp (no reduction overhead).
+    const long blocks = (long) n_head * n_q * n_stream;
+    int n_split = 1;
+    while (n_split < 8 && blocks * (n_split * 2) <= 2048 && (n_split * 2) <= n_kv) n_split *= 2;
+    const int    nthreads = 32 * n_split;
+    const size_t smem = (n_split > 1) ? ((size_t) n_split * DV + 2 * n_split) * sizeof(float) : 0;
     dim3 grid(n_head, n_q, n_stream);
-    kpc_flash_decode_kernel<<<grid, 32, 0, ctx.stream()>>>(   // one warp per (head, query, stream)
+    kpc_flash_decode_kernel<<<grid, nthreads, smem, ctx.stream()>>>(   // n_split warps per (head, query, stream)
         (const float *) Q->data, (const uint8_t *) Kp->data, (const uint8_t *) sz->data,
         (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr,
         sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride,
@@ -215,7 +249,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         V->nb[1], V->nb[2], V->nb[3],
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         mask ? (int) mask->ne[2] : 1, mask ? (int) mask->ne[3] : 1,
-        dst->nb[1], (int) dst->ne[1], (int) dst->ne[2]);
+        dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], n_split);
 }
 
 // device write: ONE block, serial over the ubatch tokens (no cross-group races). Each token is staged into
