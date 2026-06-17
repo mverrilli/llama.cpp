@@ -252,83 +252,111 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], n_split);
 }
 
-// device write: ONE block, serial over the ubatch tokens (no cross-group races). Each token is staged into
-// k_resid[w] (remembering its GLOBAL cell in k_resid_slots) and its open group is re-encoded into K from all
-// staged members, so the read stays positional (K holds valid int4 for every written cell). Multi-stream:
-// stream s = seq/n_seqps, scalezp pool = (seq%n_seqps)*band_size + group%band_size (mirrors the CPU pool_of);
-// K cell is the GLOBAL slot from k_idxs (= s*kv_size + local). No rescue/virtualization (GPU-native design).
+// device write (group-parallel seal). ONE block per (logical group g, staging slot). Each block gathers the
+// group's members once -- this ubatch's tokens (from k_cur) plus any previously-staged members (from k_resid
+// when g is the slot's open group) -- computes the per-channel scale/zp a single time, encodes the scalezp
+// slab and packs every member into its GLOBAL K cell (k_idxs for new, k_resid_slots for staged). Only the
+// slot's OPEN group (the last one, with no later token this ubatch) touches the staging tensors, so distinct
+// blocks never race on them. Replaces the old 1-block, serial-over-tokens kernel that re-encoded each group
+// ~32x. Uses only on-chip shared memory (no device scratch -> no extra VRAM). Multi-stream: stream = seq/n_seqps,
+// pool = (seq%n_seqps)*band_size + g%band_size (mirrors the CPU pool_of). No rescue/virtualization.
 static __global__ void kpc_write_kernel(
         const float * k_cur, const int32_t * kpc_seq, const int32_t * kpc_pos, const int64_t * k_idxs,
         half * k_resid, uint8_t * scalezp, int32_t * resid_slots, int32_t * staged_group, int32_t * staged_mask,
         uint8_t * K, int C, int nt, int slot_shift, int seq_mask, int L,
         int n_seqps, int band_size, int64_t sz_nb1, int64_t sz_nb2, int64_t k_nb1) {
-    if (blockIdx.x != 0) return;
-    extern __shared__ float smem[];              // scale[C], zp[C]
-    float * scale = smem; float * zp = smem + C;
+    const int g    = blockIdx.x;     // logical 32-token group
+    const int slot = blockIdx.y;     // staging slot (== seq for the supported non-virtualized cache)
+    if (slot >= L) return;
     const int krow = C / 2;
-    for (int i = 0; i < nt; ++i) {
-        const int sb   = kpc_seq[i] & seq_mask;
-        const int slot = (int) ((uint32_t) kpc_seq[i] >> slot_shift);
-        if (slot >= L) continue;                 // spill sentinel: no staging (rare; skip for first cut)
-        const int pos  = kpc_pos[i];
-        const int g = pos / GGML_KPC_GROUP, w = pos % GGML_KPC_GROUP;
-        const int st   = sb / n_seqps;                                   // physical stream
-        const int pool = (sb % n_seqps) * band_size + (g % band_size);   // scalezp pool (CPU pool_of)
-        half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
-        if (threadIdx.x == 0 && staged_group[slot] != g) { staged_group[slot] = g; staged_mask[slot] = 0; }
-        __syncthreads();
-        for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(k_cur[(size_t) i * C + c]);
-        __syncthreads();
-        if (threadIdx.x == 0) { staged_mask[slot] |= (1u << w); resid_slots[slot * GGML_KPC_GROUP + w] = (int32_t) k_idxs[i]; }
-        __syncthreads();
-        const uint32_t members = (uint32_t) staged_mask[slot];
-        // per-channel scale/zp over staged members
-        for (int c = threadIdx.x; c < C; c += blockDim.x) {
-            float mn = INFINITY, mx = -INFINITY;
-            for (int m = 0; m < GGML_KPC_GROUP; ++m) {
-                if (!(members & (1u << m))) continue;
-                float v = __half2float(rsd[(size_t) m * C + c]);
-                mn = fminf(mn, v); mx = fmaxf(mx, v);
-            }
-            float sc = (mx - mn) / 15.0f; if (sc == 0.0f) sc = 1.0f;
-            scale[c] = sc; zp[c] = mn;
+
+    extern __shared__ float smem[];  // scale[C], zp[C]
+    float * scale = smem; float * zp = smem + C;
+    __shared__ uint32_t newmask;
+    __shared__ int      has_later;
+    __shared__ int      tok_of[GGML_KPC_GROUP];    // k_cur token index that wrote within-group slot w (-1 none)
+    __shared__ int64_t  cell_of[GGML_KPC_GROUP];   // global K cell for a new member w
+    if (threadIdx.x == 0) { newmask = 0; has_later = 0; }
+    if ((int) threadIdx.x < GGML_KPC_GROUP) { tok_of[threadIdx.x] = -1; cell_of[threadIdx.x] = -1; }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < nt; i += blockDim.x) {        // find this (slot,g)'s new members + any later group
+        if ((int) ((uint32_t) kpc_seq[i] >> slot_shift) != slot) continue;
+        const int tg = kpc_pos[i] / GGML_KPC_GROUP;
+        if (tg > g) { has_later = 1; continue; }                // a later token exists -> g is not the open group
+        if (tg < g) continue;
+        const int w = kpc_pos[i] % GGML_KPC_GROUP;
+        tok_of[w]  = i;
+        cell_of[w] = k_idxs[i];
+        atomicOr(&newmask, 1u << w);
+    }
+    __syncthreads();
+
+    const uint32_t omask   = (g == staged_group[slot]) ? (uint32_t) staged_mask[slot] : 0u;   // staged members of g
+    const uint32_t members = newmask | omask;
+    if (members == 0) return;
+
+    const int sb   = slot;                                      // slot == seq (non-virtualized)
+    const int st   = sb / n_seqps;                              // physical stream
+    const int pool = (sb % n_seqps) * band_size + (g % band_size);
+    half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
+
+    // per-channel min/max over members (new from k_cur f32, staged-only from k_resid f16)
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float mn = INFINITY, mx = -INFINITY;
+        for (int w = 0; w < GGML_KPC_GROUP; ++w) {
+            if (!(members & (1u << w))) continue;
+            float v = (newmask & (1u << w)) ? k_cur[(size_t) tok_of[w] * C + c]
+                                            : __half2float(rsd[(size_t) w * C + c]);
+            mn = fminf(mn, v); mx = fmaxf(mx, v);
         }
-        __syncthreads();
-        uint8_t * s = scalezp + (size_t) st * sz_nb2 + (size_t) pool * sz_nb1;
-        if (threadIdx.x == 0) {
-            float smax = 0.0f; for (int c = 0; c < C; ++c) smax = fmaxf(smax, scale[c]);
-            float ss = smax / 255.0f; if (ss == 0.0f) ss = 1.0f;
-            float zmn = INFINITY, zmx = -INFINITY; for (int c = 0; c < C; ++c) { zmn = fminf(zmn, zp[c]); zmx = fmaxf(zmx, zp[c]); }
-            float sz = (zmx - zmn) / 255.0f; if (sz == 0.0f) sz = 1.0f;
-            *(half *)(s + 0) = __float2half(ss); *(half *)(s + 2) = __float2half(zmn); *(half *)(s + 4) = __float2half(sz);
-            uint8_t * qs = s + 6; uint8_t * qz = s + 6 + C;
-            for (int c = 0; c < C; ++c) {
-                int a = (int)(scale[c]/ss + 0.5f); a = a<0?0:(a>255?255:a);
-                int b = (int)((zp[c]-zmn)/sz + 0.5f); b = b<0?0:(b>255?255:b);
-                qs[c] = (uint8_t) a; qz[c] = (uint8_t) b;
-            }
+        float sc = (mx - mn) / 15.0f; if (sc == 0.0f) sc = 1.0f;
+        scale[c] = sc; zp[c] = mn;
+    }
+    __syncthreads();
+    uint8_t * s = scalezp + (size_t) st * sz_nb2 + (size_t) pool * sz_nb1;
+    if (threadIdx.x == 0) {
+        float smax = 0.0f; for (int c = 0; c < C; ++c) smax = fmaxf(smax, scale[c]);
+        float ss = smax / 255.0f; if (ss == 0.0f) ss = 1.0f;
+        float zmn = INFINITY, zmx = -INFINITY; for (int c = 0; c < C; ++c) { zmn = fminf(zmn, zp[c]); zmx = fmaxf(zmx, zp[c]); }
+        float sz = (zmx - zmn) / 255.0f; if (sz == 0.0f) sz = 1.0f;
+        *(half *)(s + 0) = __float2half(ss); *(half *)(s + 2) = __float2half(zmn); *(half *)(s + 4) = __float2half(sz);
+        uint8_t * qs = s + 6; uint8_t * qz = s + 6 + C;
+        for (int c = 0; c < C; ++c) {
+            int a = (int)(scale[c]/ss + 0.5f); a = a<0?0:(a>255?255:a);
+            int b = (int)((zp[c]-zmn)/sz + 0.5f); b = b<0?0:(b>255?255:b);
+            qs[c] = (uint8_t) a; qz[c] = (uint8_t) b;
         }
-        __syncthreads();
-        float ss, zmn, sz; kpc_slab_super(s, &ss, &zmn, &sz);
-        const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C;
-        // pack every staged member's int4 into its GLOBAL K cell (from k_resid_slots).
-        // Thread owns a whole BYTE (channels 2b low + 2b+1 high): packing per-channel would race on the
-        // shared nibble byte (read-modify-write), corrupting ~half the cache non-deterministically.
-        for (int m = 0; m < GGML_KPC_GROUP; ++m) {
-            if (!(members & (1u << m))) continue;
-            const int64_t cell = resid_slots[slot * GGML_KPC_GROUP + m];   // global slot = st*kv_size + local
-            uint8_t    * row = K + (size_t) cell * k_nb1;
-            const half * rv  = rsd + (size_t) m * C;
-            for (int b = threadIdx.x; b < krow; b += blockDim.x) {
-                const int c0 = 2 * b, c1 = 2 * b + 1;
-                int q0 = (int)((__half2float(rv[c0]) - (zmn + qz[c0]*sz)) / (qs[c0]*ss) + 0.5f);
-                int q1 = (int)((__half2float(rv[c1]) - (zmn + qz[c1]*sz)) / (qs[c1]*ss) + 0.5f);
-                q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
-                q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
-                row[b] = (uint8_t)(q0 | (q1 << 4));
-            }
+    }
+    __syncthreads();
+    float ss, zmn, sz; kpc_slab_super(s, &ss, &zmn, &sz);
+    const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C;
+    // pack every member into its GLOBAL K cell, one whole byte per thread (no nibble RMW race)
+    for (int w = 0; w < GGML_KPC_GROUP; ++w) {
+        if (!(members & (1u << w))) continue;
+        const bool    isnew = newmask & (1u << w);
+        const int64_t cell  = isnew ? cell_of[w] : (int64_t) resid_slots[slot * GGML_KPC_GROUP + w];
+        uint8_t * row = K + (size_t) cell * k_nb1;
+        for (int b = threadIdx.x; b < krow; b += blockDim.x) {
+            const int c0 = 2 * b, c1 = 2 * b + 1;
+            float v0 = isnew ? k_cur[(size_t) tok_of[w] * C + c0] : __half2float(rsd[(size_t) w * C + c0]);
+            float v1 = isnew ? k_cur[(size_t) tok_of[w] * C + c1] : __half2float(rsd[(size_t) w * C + c1]);
+            int q0 = (int)((v0 - (zmn + qz[c0]*sz)) / (qs[c0]*ss) + 0.5f);
+            int q1 = (int)((v1 - (zmn + qz[c1]*sz)) / (qs[c1]*ss) + 0.5f);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            row[b] = (uint8_t)(q0 | (q1 << 4));
         }
-        __syncthreads();
+    }
+    __syncthreads();
+    // staging update: only the OPEN group (no later token this ubatch) persists the window for the next ubatch.
+    if (!has_later) {
+        for (int w = 0; w < GGML_KPC_GROUP; ++w) {
+            if (!(newmask & (1u << w))) continue;
+            for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(k_cur[(size_t) tok_of[w] * C + c]);
+            if (threadIdx.x == 0) resid_slots[slot * GGML_KPC_GROUP + w] = (int32_t) cell_of[w];
+        }
+        if (threadIdx.x == 0) { staged_group[slot] = g; staged_mask[slot] = (int32_t) members; }
     }
 }
 
@@ -352,7 +380,8 @@ void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int   n_seqps   = n_seq_max / n_stream;
     const int   band_size = ng_max / n_seqps;
     const size_t smem = 2 * C * sizeof(float);
-    kpc_write_kernel<<<1, 256, smem, ctx.stream()>>>(
+    dim3 grid(ng_max, L, 1);   // one block per (logical group, staging slot); empty blocks early-return
+    kpc_write_kernel<<<grid, 256, smem, ctx.stream()>>>(
         (const float *) k_cur->data, (const int32_t *) kseq->data, (const int32_t *) kpos->data,
         (const int64_t *) k_idxs->data, (half *) k_resid->data, (uint8_t *) scalezp->data,
         (int32_t *) rslots->data, (int32_t *) sgrp->data, (int32_t *) smask->data, (uint8_t *) dst->data,
