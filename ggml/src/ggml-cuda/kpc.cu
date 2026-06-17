@@ -124,22 +124,40 @@ static __global__ void kpc_flash_decode_kernel(
     for (int j = 0; j < ndv; ++j) acc[j] = 0.0f;
     float m = -INFINITY, l = 0.0f;
 
+    // KPC groups 32 keys under one scalezp slab, so the per-channel Q*scale fold + zp correction is constant
+    // across a group: compute it once per pool (qp[] = q*scale for this lane's channels, corr = sum q*zp) and
+    // reuse it for every key in the group. Per key then costs only int4 loads + a MAD (was a full re-fold/key).
+    float qp[8];                                             // head_dim <= 256 -> <= 8 channels per lane
+    float corr = 0.0f;
+    int   cur_pool = -1;
+
     for (int t = wid; t < n_kv; t += n_split) {              // split-K: warp wid owns keys {wid, wid+n_split, ...}
         const float mv = mp ? __half2float(mp[t]) : 0.0f;
         if (mp && mv == -INFINITY) continue;                 // same for every lane -> no warp divergence
         int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
         if (pool < 0) pool = 0;
-        const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
-        float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
-        const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+        if (pool != cur_pool) {                              // entered a new group -> refold Q against its scale/zp
+            const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
+            float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
+            const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+            float lc = 0.0f; int ci = 0;
+            for (int c = lane; c < head_dim; c += 32, ++ci) {
+                const int fc = cbase + c;
+                qp[ci] = qrow[c] * (qs[fc] * ss);
+                lc    += qrow[c] * (zmn + qz[fc] * szc);
+            }
+            for (int o = 16; o > 0; o >>= 1) lc += __shfl_xor_sync(0xffffffff, lc, o);
+            corr = lc;                                       // sum_c q[c]*zp[c] (same for every key in the group)
+            cur_pool = pool;
+        }
         const uint8_t * krow = (const uint8_t *) Kp + (size_t) t * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
-        float part = 0.0f;                                   // lane's slice of the per-channel dot
-        for (int c = lane; c < head_dim; c += 32) {
-            const int fc = cbase + c;
-            part += qrow[c] * kpc_deq_nib(krow[c >> 1], c, qs[fc] * ss, zmn + qz[fc] * szc);
+        float part = 0.0f; int ci = 0;                       // lane's slice of sum_c qp[c]*nibble[c]
+        for (int c = lane; c < head_dim; c += 32, ++ci) {
+            const uint8_t nb = krow[c >> 1];
+            part += qp[ci] * (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F));
         }
         for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffff, part, o);   // warp-reduce -> all lanes
-        float score = part * kqscale;
+        float score = (part + corr) * kqscale;
         if (logit_softcap != 0.0f) score = logit_softcap * tanhf(score / logit_softcap);
         score += slope * mv;
 
