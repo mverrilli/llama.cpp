@@ -98,7 +98,8 @@ static __global__ void kpc_flash_decode_kernel(
     const int iq2 = blockIdx.x;   // query head
     const int iq1 = blockIdx.y;   // query position
     const int iq3 = blockIdx.z;   // stream
-    if (iq2 >= n_head || iq1 >= n_q || iq3 >= n_stream || threadIdx.x != 0) return;
+    if (iq2 >= n_head || iq1 >= n_q || iq3 >= n_stream) return;
+    const int lane = threadIdx.x;                            // one warp (32 lanes) per (head, query, stream)
 
     const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
     const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
@@ -116,57 +117,62 @@ static __global__ void kpc_flash_decode_kernel(
     const float * qrow = (const float *)((const char *) Q + (size_t) iq1 * q_nb1 + (size_t) iq2 * q_nb2 + (size_t) iq3 * q_nb3);
     const half  * mp   = mask ? (const half *)((const char *) mask + (size_t) iq1 * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
 
+    // each lane owns DV elements {lane, lane+32, ...} of the running VKQ accumulator (registers)
+    const int ndv = (DV + 31) / 32;                          // DV <= 512 -> <= 16
+    float acc[16];
+    for (int j = 0; j < ndv; ++j) acc[j] = 0.0f;
     float m = -INFINITY, l = 0.0f;
-    extern __shared__ float acc[];                            // DV
-    for (int d = 0; d < DV; ++d) acc[d] = 0.0f;
 
     for (int t = 0; t < n_kv; ++t) {
         const float mv = mp ? __half2float(mp[t]) : 0.0f;
-        if (mp && mv == -INFINITY) continue;
+        if (mp && mv == -INFINITY) continue;                 // same for every lane -> no warp divergence
         int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
         if (pool < 0) pool = 0;
         const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
         float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
         const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
         const uint8_t * krow = (const uint8_t *) Kp + (size_t) t * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
-        float score = 0.0f;
-        for (int c = 0; c < head_dim; ++c) {                 // dot over this kv-head's channel slice
+        float part = 0.0f;                                   // lane's slice of the per-channel dot
+        for (int c = lane; c < head_dim; c += 32) {
             const int fc = cbase + c;
-            score += qrow[c] * kpc_deq_nib(krow[c >> 1], c, qs[fc] * ss, zmn + qz[fc] * szc);
+            part += qrow[c] * kpc_deq_nib(krow[c >> 1], c, qs[fc] * ss, zmn + qz[fc] * szc);
         }
-        score *= kqscale;
+        for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffff, part, o);   // warp-reduce -> all lanes
+        float score = part * kqscale;
         if (logit_softcap != 0.0f) score = logit_softcap * tanhf(score / logit_softcap);
         score += slope * mv;
 
-        float mn = fmaxf(m, score), a = expf(m - mn), p = expf(score - mn);
+        const float mn = fmaxf(m, score), a = expf(m - mn), p = expf(score - mn);
         l = l * a + p;
         const uint8_t * vrow = (const uint8_t *) V + (size_t) t * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
-        if (v_q41) {
-            for (int d = 0; d < DV; ++d) {
+        for (int j = 0; j < ndv; ++j) {
+            const int d = lane + j * 32;
+            if (d >= DV) break;
+            float vv;
+            if (v_q41) {
                 const uint8_t * blk = vrow + (d / 32) * 20;          // q4_1 block: [f16 d][f16 m][16B nibbles]
                 const float vd = __half2float(*(const half *)(blk + 0));
                 const float vm = __half2float(*(const half *)(blk + 2));
-                const int j = d % 32;
-                const uint8_t b = blk[4 + (j % 16)];
-                const int qv = (j < 16) ? (b & 0x0F) : (b >> 4);
-                acc[d] = acc[d] * a + p * (qv * vd + vm);
+                const int dj = d % 32;
+                const uint8_t b = blk[4 + (dj % 16)];
+                vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
+            } else {
+                vv = __half2float(((const half *) vrow)[d]);
             }
-        } else {                                                    // f16 V
-            const half * vh = (const half *) vrow;
-            for (int d = 0; d < DV; ++d) acc[d] = acc[d] * a + p * __half2float(vh[d]);
+            acc[j] = acc[j] * a + p * vv;
         }
         m = mn;
     }
     if (sinks) {                                                    // attention sink: fold sink logit into denom
         const float sk = sinks[iq2];
-        float mn = fmaxf(m, sk), a = expf(m - mn), p = expf(sk - mn);
+        const float mn = fmaxf(m, sk), a = expf(m - mn), p = expf(sk - mn);
         l = l * a + p;
-        for (int d = 0; d < DV; ++d) acc[d] = acc[d] * a;
+        for (int j = 0; j < ndv; ++j) acc[j] *= a;
         m = mn;
     }
     const float Sinv = (l == 0.0f) ? 0.0f : 1.0f / l;
     float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
-    for (int d = 0; d < DV; ++d) out[d] = acc[d] * Sinv;
+    for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[j] * Sinv; }
 }
 
 // ---- host wrappers (thin launchers; exercised once M3 wires the GPU-native tensors) ----
@@ -195,9 +201,8 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool v_q41 = V->type == GGML_TYPE_Q4_1;
 
     const int gi_stride = gi ? (int) (gi->nb[1] / sizeof(int32_t)) : 0;   // per-stream stride (= kv_size)
-    const size_t smem = DV * sizeof(float);
     dim3 grid(n_head, n_q, n_stream);
-    kpc_flash_decode_kernel<<<grid, 1, smem, ctx.stream()>>>(
+    kpc_flash_decode_kernel<<<grid, 32, 0, ctx.stream()>>>(   // one warp per (head, query, stream)
         (const float *) Q->data, (const uint8_t *) Kp->data, (const uint8_t *) sz->data,
         (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr,
         sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride,
