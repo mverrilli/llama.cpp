@@ -12,6 +12,7 @@
 
 void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_kpc_write     (ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_kpc_dequant   (ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_kpc_requant   (ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // supports_op gate. Returns false until the kv-cache GPU-native integration (M3) lands, so the

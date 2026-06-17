@@ -559,7 +559,12 @@ int32_t llama_kv_cache::kpc_staged_mask(uint32_t il, int32_t slot) const {
         return 0;
     }
     const auto & layer = layers[it->second];
-    return layer.staged_mask ? ((const int32_t *) layer.staged_mask->data)[slot] : 0;
+    if (!layer.staged_mask) {
+        return 0;
+    }
+    int32_t mask = 0;   // staged_mask may be device-resident (KPC CUDA) -> backend-safe read
+    ggml_backend_tensor_get(layer.staged_mask, &mask, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
+    return mask;
 }
 
 int32_t llama_kv_cache::kpc_slot_of(llama_seq_id seq_id) const {
@@ -570,9 +575,10 @@ void llama_kv_cache::kpc_clear_staging_slot(int32_t slot) const {
     if (slot < 0) {
         return;
     }
+    const int32_t zero = 0;               // staged tensors may be device-resident (KPC CUDA) -> backend-safe write
     for (const auto & layer : layers) {   // no-op for non-KPC layers (staged tensors are null)
-        if (layer.staged_mask)  ((int32_t *) layer.staged_mask->data)[slot]  = 0;
-        if (layer.staged_group) ((int32_t *) layer.staged_group->data)[slot] = 0;
+        if (layer.staged_mask)  ggml_backend_tensor_set(layer.staged_mask,  &zero, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
+        if (layer.staged_group) ggml_backend_tensor_set(layer.staged_group, &zero, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
     }
 }
 
@@ -603,16 +609,22 @@ void llama_kv_cache::kpc_trim_staging(llama_seq_id seq_id, llama_pos p0, llama_p
         if (!layer.staged_mask) {
             continue;
         }
-        int32_t & mask = ((int32_t *) layer.staged_mask->data)[slot];
+        int32_t mask = 0;   // staged tensors may be device-resident (KPC CUDA) -> backend-safe read/modify/write
+        ggml_backend_tensor_get(layer.staged_mask, &mask, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
         if (mask == 0) {
             continue;
         }
-        const int32_t grp = ((const int32_t *) layer.staged_group->data)[slot];
+        int32_t grp = 0;
+        ggml_backend_tensor_get(layer.staged_group, &grp, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
+        const int32_t orig = mask;
         for (int w = 0; w < KPC_GROUP; ++w) {
             const llama_pos pos = (llama_pos) grp*KPC_GROUP + w - off;
             if ((mask & (1 << w)) && pos >= p0 && pos < p1) {
                 mask &= ~(1 << w);
             }
+        }
+        if (mask != orig) {
+            ggml_backend_tensor_set(layer.staged_mask, &mask, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
         }
     }
 }

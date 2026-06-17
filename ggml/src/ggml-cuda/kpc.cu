@@ -316,14 +316,112 @@ void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         n_seqps, band_size, scalezp->nb[1], scalezp->nb[2], dst->nb[1]);
 }
 
+// ---- dequant: packed int4 K [C,n_kv,ns] -> f16, positional pool = cell>>5 per stream (RoPE shift / state) ----
+static __global__ void kpc_dequant_kernel(
+        const uint8_t * pk, const uint8_t * sz0, half * dst,
+        int C, int n_kv, int ns, int64_t k_nb1, int64_t k_nb2, int64_t sz_nb1, int64_t sz_nb2,
+        int64_t d_nb1, int64_t d_nb2) {
+    const int t = blockIdx.x;
+    const int s = blockIdx.y;
+    if (t >= n_kv || s >= ns) return;
+    const uint8_t * slab = sz0 + (size_t) s * sz_nb2 + (size_t)(t / GGML_KPC_GROUP) * sz_nb1;
+    float ss, zmn, szc; kpc_slab_super(slab, &ss, &zmn, &szc);
+    const uint8_t * qs = slab + 6; const uint8_t * qz = slab + 6 + C;
+    const uint8_t * row  = pk  + (size_t) s * k_nb2 + (size_t) t * k_nb1;
+    half          * drow = (half *)((char *) dst + (size_t) s * d_nb2 + (size_t) t * d_nb1);
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        drow[c] = __float2half(kpc_deq_nib(row[c >> 1], c, qs[c] * ss, zmn + qz[c] * szc));
+    }
+}
+
+void ggml_cuda_kpc_dequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * pk = dst->src[0];
+    const ggml_tensor * sz = dst->src[1];
+    const int C    = pk->ne[0];
+    const int n_kv = pk->ne[1];
+    const int ns   = pk->ne[2];
+    dim3 grid(n_kv, ns, 1);
+    kpc_dequant_kernel<<<grid, 256, 0, ctx.stream()>>>(
+        (const uint8_t *) pk->data, (const uint8_t *) sz->data, (half *) dst->data,
+        C, n_kv, ns, pk->nb[1], pk->nb[2], sz->nb[1], sz->nb[2], dst->nb[1], dst->nb[2]);
+}
+
+// ---- requant roped f32 K [C,n_kv,ns] -> packed int4 + scalezp, in place. One block per (group, stream);
+// positional 32-cell groups (pool = group), mirrors the CPU recipe (min/max -> scale=(mx-mn)/15, int8 slab). ----
+static __global__ void kpc_requant_kernel(
+        const float * roped, uint8_t * pk, uint8_t * sz0,
+        int C, int n_kv, int ns, int64_t r_nb1, int64_t r_nb2, int64_t k_nb1, int64_t k_nb2,
+        int64_t sz_nb1, int64_t sz_nb2) {
+    const int p = blockIdx.x;          // group (pool, positional)
+    const int s = blockIdx.y;          // stream
+    if (s >= ns) return;
+    const int c0 = p * GGML_KPC_GROUP;
+    if (c0 >= n_kv) return;
+    const int cn = (c0 + GGML_KPC_GROUP < n_kv) ? GGML_KPC_GROUP : (n_kv - c0);   // cells in this group
+    const int krow = C / 2;
+    extern __shared__ float smem[];    // scale[C], zp[C]
+    float * scale = smem; float * zp = smem + C;
+    const float * rbase = (const float *)((const char *) roped + (size_t) s * r_nb2);
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float mn = INFINITY, mx = -INFINITY;
+        for (int j = 0; j < cn; ++j) {
+            const float v = *(const float *)((const char *) rbase + (size_t)(c0 + j) * r_nb1 + (size_t) c * sizeof(float));
+            mn = fminf(mn, v); mx = fmaxf(mx, v);
+        }
+        float sc = (mx - mn) / 15.0f; if (sc == 0.0f) sc = 1.0f;
+        scale[c] = sc; zp[c] = mn;
+    }
+    __syncthreads();
+    uint8_t * slab = sz0 + (size_t) s * sz_nb2 + (size_t) p * sz_nb1;
+    if (threadIdx.x == 0) {
+        float smax = 0.0f; for (int c = 0; c < C; ++c) smax = fmaxf(smax, scale[c]);
+        float ss = smax / 255.0f; if (ss == 0.0f) ss = 1.0f;
+        float zmn = INFINITY, zmx = -INFINITY; for (int c = 0; c < C; ++c) { zmn = fminf(zmn, zp[c]); zmx = fmaxf(zmx, zp[c]); }
+        float sz = (zmx - zmn) / 255.0f; if (sz == 0.0f) sz = 1.0f;
+        *(half *)(slab + 0) = __float2half(ss); *(half *)(slab + 2) = __float2half(zmn); *(half *)(slab + 4) = __float2half(sz);
+        uint8_t * qs = slab + 6; uint8_t * qz = slab + 6 + C;
+        for (int c = 0; c < C; ++c) {
+            int a = (int)(scale[c]/ss + 0.5f); a = a<0?0:(a>255?255:a);
+            int b = (int)((zp[c]-zmn)/sz + 0.5f); b = b<0?0:(b>255?255:b);
+            qs[c] = (uint8_t) a; qz[c] = (uint8_t) b;
+        }
+    }
+    __syncthreads();
+    float ss, zmn, sz; kpc_slab_super(slab, &ss, &zmn, &sz);
+    const uint8_t * qs = slab + 6; const uint8_t * qz = slab + 6 + C;
+    for (int j = 0; j < cn; ++j) {     // repack each cell, one whole byte per thread (no nibble RMW race)
+        uint8_t     * row = pk + (size_t) s * k_nb2 + (size_t)(c0 + j) * k_nb1;
+        const float * rc  = (const float *)((const char *) rbase + (size_t)(c0 + j) * r_nb1);
+        for (int b = threadIdx.x; b < krow; b += blockDim.x) {
+            int q0 = (int)((rc[2*b]   - (zmn + qz[2*b]  *sz)) / (qs[2*b]  *ss) + 0.5f);
+            int q1 = (int)((rc[2*b+1] - (zmn + qz[2*b+1]*sz)) / (qs[2*b+1]*ss) + 0.5f);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            row[b] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
 void ggml_cuda_kpc_requant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_UNUSED(ctx); GGML_UNUSED(dst);
-    GGML_ABORT("KPC CUDA requant (RoPE context-shift) not implemented yet (M4)");
+    const ggml_tensor * roped = dst->src[0];   // f32 [C, n_kv, ns]
+    const ggml_tensor * sz    = dst->src[2];   // scalezp (in place)
+    const int C    = roped->ne[0];
+    const int n_kv = roped->ne[1];
+    const int ns   = roped->ne[2];
+    const int ng   = (n_kv + GGML_KPC_GROUP - 1) / GGML_KPC_GROUP;
+    const size_t smem = 2 * C * sizeof(float);
+    dim3 grid(ng, ns, 1);
+    kpc_requant_kernel<<<grid, 256, smem, ctx.stream()>>>(
+        (const float *) roped->data, (uint8_t *) dst->data, (uint8_t *) sz->data,
+        C, n_kv, ns, roped->nb[1], roped->nb[2], dst->nb[1], dst->nb[2], sz->nb[1], sz->nb[2]);
 }
 
 bool ggml_cuda_kpc_supported(const ggml_tensor * op) {
-    // M3 first run (single-stream): READ + WRITE on the GPU (K/scalezp/k_resid/staging device-resident,
-    // mutated in place by the write kernel). REQUANT (RoPE shift) stays on CPU until its kernel lands (M4).
+    // GPU-native KPC: READ + WRITE + DEQUANT + REQUANT all on the GPU (K/scalezp/k_resid/staging are
+    // device-resident and mutated in place). The shift's dequant->rope->requant therefore stays on-device
+    // (requant writes the packed K in place, which a CPU op cannot do for a device tensor).
     if (getenv("KPC_CUDA_OFF")) return false;   // DEBUG: force KPC onto CPU for A/B comparison
-    return op->op == GGML_OP_KPC_FLASH_ATTN || op->op == GGML_OP_KPC_WRITE;
+    return op->op == GGML_OP_KPC_FLASH_ATTN || op->op == GGML_OP_KPC_WRITE ||
+           op->op == GGML_OP_KPC_DEQUANT    || op->op == GGML_OP_KPC_REQUANT;
 }

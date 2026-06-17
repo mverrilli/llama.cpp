@@ -3127,6 +3127,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_KPC_WRITE:
             ggml_cuda_kpc_write(ctx, dst);
             break;
+        case GGML_OP_KPC_DEQUANT:
+            ggml_cuda_kpc_dequant(ctx, dst);
+            break;
         case GGML_OP_KPC_REQUANT:
             ggml_cuda_kpc_requant(ctx, dst);
             break;
