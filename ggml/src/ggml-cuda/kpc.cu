@@ -86,7 +86,7 @@ static __global__ void kpc_seal_kernel(const float * in, uint8_t * nib, uint8_t 
 // scalezp slab carries all C_full=n_embd_k_gqa channels, so the head's slice starts at cbase=ik2*head_dim.
 static __global__ void kpc_flash_decode_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
-        const float * sinks, float kqscale, float max_bias, float logit_softcap, float * dst,
+        const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
         int head_dim, int DV, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
         int rk2, int rv2, int rk3, int rv3, bool v_q41,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
@@ -123,7 +123,9 @@ static __global__ void kpc_flash_decode_kernel(
     for (int t = 0; t < n_kv; ++t) {
         const float mv = mp ? __half2float(mp[t]) : 0.0f;
         if (mp && mv == -INFINITY) continue;
-        const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t)(t / GGML_KPC_GROUP) * sz_nb1;
+        int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
+        if (pool < 0) pool = 0;
+        const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
         float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
         const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
         const uint8_t * krow = (const uint8_t *) Kp + (size_t) t * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
@@ -175,6 +177,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * sz    = dst->src[2];
     const ggml_tensor * V     = dst->src[3];
     const ggml_tensor * mask  = dst->src[4];
+    const ggml_tensor * gi    = dst->src[5];   // group_index [n_kv, ns] (cell->pool); null -> positional
     const ggml_tensor * sinks = dst->src[6];
     float params[3]; memcpy(params, dst->op_params, sizeof(params));   // kq_scale, max_bias, logit_softcap
 
@@ -191,12 +194,14 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int rk3 = n_stream / (int) Kp->ne[3], rv3 = n_stream / (int) V->ne[3];
     const bool v_q41 = V->type == GGML_TYPE_Q4_1;
 
+    const int gi_stride = gi ? (int) (gi->nb[1] / sizeof(int32_t)) : 0;   // per-stream stride (= kv_size)
     const size_t smem = DV * sizeof(float);
     dim3 grid(n_head, n_q, n_stream);
     kpc_flash_decode_kernel<<<grid, 1, smem, ctx.stream()>>>(
         (const float *) Q->data, (const uint8_t *) Kp->data, (const uint8_t *) sz->data,
         (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr,
-        sinks ? (const float *) sinks->data : nullptr, params[0], params[1], params[2], (float *) dst->data,
+        sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride,
+        params[0], params[1], params[2], (float *) dst->data,
         head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream,
         rk2, rv2, rk3, rv3, v_q41,
         Q->nb[1], Q->nb[2], Q->nb[3],
@@ -318,13 +323,15 @@ void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // ---- dequant: packed int4 K [C,n_kv,ns] -> f16, positional pool = cell>>5 per stream (RoPE shift / state) ----
 static __global__ void kpc_dequant_kernel(
-        const uint8_t * pk, const uint8_t * sz0, half * dst,
+        const uint8_t * pk, const uint8_t * sz0, const int32_t * gid, int gi_stride, half * dst,
         int C, int n_kv, int ns, int64_t k_nb1, int64_t k_nb2, int64_t sz_nb1, int64_t sz_nb2,
         int64_t d_nb1, int64_t d_nb2) {
     const int t = blockIdx.x;
     const int s = blockIdx.y;
     if (t >= n_kv || s >= ns) return;
-    const uint8_t * slab = sz0 + (size_t) s * sz_nb2 + (size_t)(t / GGML_KPC_GROUP) * sz_nb1;
+    int pool = gid ? gid[(size_t) s * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
+    if (pool < 0) pool = 0;
+    const uint8_t * slab = sz0 + (size_t) s * sz_nb2 + (size_t) pool * sz_nb1;
     float ss, zmn, szc; kpc_slab_super(slab, &ss, &zmn, &szc);
     const uint8_t * qs = slab + 6; const uint8_t * qz = slab + 6 + C;
     const uint8_t * row  = pk  + (size_t) s * k_nb2 + (size_t) t * k_nb1;
@@ -337,36 +344,43 @@ static __global__ void kpc_dequant_kernel(
 void ggml_cuda_kpc_dequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * pk = dst->src[0];
     const ggml_tensor * sz = dst->src[1];
+    const ggml_tensor * gi = dst->src[2];   // group_index [n_kv, ns] (cell->pool); null -> positional
     const int C    = pk->ne[0];
     const int n_kv = pk->ne[1];
     const int ns   = pk->ne[2];
+    const int gi_stride = gi ? (int) (gi->nb[1] / sizeof(int32_t)) : 0;
     dim3 grid(n_kv, ns, 1);
     kpc_dequant_kernel<<<grid, 256, 0, ctx.stream()>>>(
-        (const uint8_t *) pk->data, (const uint8_t *) sz->data, (half *) dst->data,
-        C, n_kv, ns, pk->nb[1], pk->nb[2], sz->nb[1], sz->nb[2], dst->nb[1], dst->nb[2]);
+        (const uint8_t *) pk->data, (const uint8_t *) sz->data, gi ? (const int32_t *) gi->data : nullptr, gi_stride,
+        (half *) dst->data, C, n_kv, ns, pk->nb[1], pk->nb[2], sz->nb[1], sz->nb[2], dst->nb[1], dst->nb[2]);
 }
 
-// ---- requant roped f32 K [C,n_kv,ns] -> packed int4 + scalezp, in place. One block per (group, stream);
-// positional 32-cell groups (pool = group), mirrors the CPU recipe (min/max -> scale=(mx-mn)/15, int8 slab). ----
+// ---- requant roped f32 K [C,n_kv,ns] -> packed int4 + scalezp, in place. One block per (pool, stream);
+// cells are bucketed by group_index[cell]==pool (mirrors the CPU requant), so a RoPE shift that regroups
+// cells re-encodes each referenced pool consistently. min/max -> scale=(mx-mn)/15 + int8 double-quant slab. ----
 static __global__ void kpc_requant_kernel(
-        const float * roped, uint8_t * pk, uint8_t * sz0,
+        const float * roped, const int32_t * gid, int gi_stride, uint8_t * pk, uint8_t * sz0,
         int C, int n_kv, int ns, int64_t r_nb1, int64_t r_nb2, int64_t k_nb1, int64_t k_nb2,
         int64_t sz_nb1, int64_t sz_nb2) {
-    const int p = blockIdx.x;          // group (pool, positional)
+    const int p = blockIdx.x;          // pool
     const int s = blockIdx.y;          // stream
     if (s >= ns) return;
-    const int c0 = p * GGML_KPC_GROUP;
-    if (c0 >= n_kv) return;
-    const int cn = (c0 + GGML_KPC_GROUP < n_kv) ? GGML_KPC_GROUP : (n_kv - c0);   // cells in this group
     const int krow = C / 2;
+    const int32_t * gid_s = gid + (size_t) s * gi_stride;
     extern __shared__ float smem[];    // scale[C], zp[C]
     float * scale = smem; float * zp = smem + C;
     const float * rbase = (const float *)((const char *) roped + (size_t) s * r_nb2);
 
+    __shared__ int n_cells;
+    if (threadIdx.x == 0) { n_cells = 0; for (int i = 0; i < n_kv; ++i) if (gid_s[i] == p) ++n_cells; }
+    __syncthreads();
+    if (n_cells == 0) return;          // pool unused -> leave its slab/K untouched
+
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         float mn = INFINITY, mx = -INFINITY;
-        for (int j = 0; j < cn; ++j) {
-            const float v = *(const float *)((const char *) rbase + (size_t)(c0 + j) * r_nb1 + (size_t) c * sizeof(float));
+        for (int i = 0; i < n_kv; ++i) {
+            if (gid_s[i] != p) continue;
+            const float v = *(const float *)((const char *) rbase + (size_t) i * r_nb1 + (size_t) c * sizeof(float));
             mn = fminf(mn, v); mx = fmaxf(mx, v);
         }
         float sc = (mx - mn) / 15.0f; if (sc == 0.0f) sc = 1.0f;
@@ -390,9 +404,10 @@ static __global__ void kpc_requant_kernel(
     __syncthreads();
     float ss, zmn, sz; kpc_slab_super(slab, &ss, &zmn, &sz);
     const uint8_t * qs = slab + 6; const uint8_t * qz = slab + 6 + C;
-    for (int j = 0; j < cn; ++j) {     // repack each cell, one whole byte per thread (no nibble RMW race)
-        uint8_t     * row = pk + (size_t) s * k_nb2 + (size_t)(c0 + j) * k_nb1;
-        const float * rc  = (const float *)((const char *) rbase + (size_t)(c0 + j) * r_nb1);
+    for (int i = 0; i < n_kv; ++i) {   // repack each pool cell, one whole byte per thread (no nibble RMW race)
+        if (gid_s[i] != p) continue;
+        uint8_t     * row = pk + (size_t) s * k_nb2 + (size_t) i * k_nb1;
+        const float * rc  = (const float *)((const char *) rbase + (size_t) i * r_nb1);
         for (int b = threadIdx.x; b < krow; b += blockDim.x) {
             int q0 = (int)((rc[2*b]   - (zmn + qz[2*b]  *sz)) / (qs[2*b]  *ss) + 0.5f);
             int q1 = (int)((rc[2*b+1] - (zmn + qz[2*b+1]*sz)) / (qs[2*b+1]*ss) + 0.5f);
@@ -405,15 +420,17 @@ static __global__ void kpc_requant_kernel(
 
 void ggml_cuda_kpc_requant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * roped = dst->src[0];   // f32 [C, n_kv, ns]
+    const ggml_tensor * gi    = dst->src[1];   // group_index [n_kv, ns] (cell->pool)
     const ggml_tensor * sz    = dst->src[2];   // scalezp (in place)
     const int C    = roped->ne[0];
     const int n_kv = roped->ne[1];
     const int ns   = roped->ne[2];
-    const int ng   = (n_kv + GGML_KPC_GROUP - 1) / GGML_KPC_GROUP;
+    const int ng   = (int) sz->ne[1];          // pool count (ng_max)
+    const int gi_stride = (int) (gi->nb[1] / sizeof(int32_t));
     const size_t smem = 2 * C * sizeof(float);
     dim3 grid(ng, ns, 1);
     kpc_requant_kernel<<<grid, 256, smem, ctx.stream()>>>(
-        (const float *) roped->data, (uint8_t *) dst->data, (uint8_t *) sz->data,
+        (const float *) roped->data, (const int32_t *) gi->data, gi_stride, (uint8_t *) dst->data, (uint8_t *) sz->data,
         C, n_kv, ns, roped->nb[1], roped->nb[2], dst->nb[1], dst->nb[2], sz->nb[1], sz->nb[2]);
 }
 

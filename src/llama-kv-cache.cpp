@@ -1842,6 +1842,14 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
             kpc_eff_offset[sb] += 1;
         }
     }
+
+    // CUDA path: the device write kernel pools positionally and never maintains the host group_index, so
+    // refresh it from the committed cell positions here (the GPU read/dequant/requant consult it). Matches
+    // the CPU write's pooling for the non-virtualized cache; pre-shift it equals cell/32 (no change), and it
+    // stays correct after a RoPE shift. Skipped when virtualized (CPU-only; its write keeps gid incrementally).
+    if (!virtualized) {
+        kpc_rebuild_group_index();
+    }
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -1891,17 +1899,14 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     }
 }
 
-void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(gi_old->buffer));
-    GGML_ASSERT(kpc_enabled());
-
-    const uint32_t kvs = get_size();
-
-    // all layers carry the same cell->pool map; snapshot it for the in-graph dequant
-    memcpy(gi_old->data, layers[0].group_index->data, (size_t) kvs*n_stream*sizeof(int32_t));
-
-    // rebuild group_index from the post-shift positions; the in-graph requant re-encodes every
-    // referenced pool. cursors reset and staging drops - the next write rescues the open group.
+// Rebuild the cell->pool map (group_index) from the current cell positions, for every layer.
+// pool = (seq_band) + (logical_group % band_size); empty cells map to -1. This is the same mapping the
+// CPU write assigns incrementally; rebuilding it wholesale keeps group_index correct for the CUDA path
+// (where the device write kernel pools positionally and never touches the host group_index) and after a
+// RoPE shift (where physical cell != logical position). group_index lives on a host buffer, so the GPU
+// read/dequant/requant receive it as a host op-input that the scheduler copies to the device.
+void llama_kv_cache::kpc_rebuild_group_index() const {
+    const uint32_t kvs       = get_size();
     const uint32_t n_seqps   = n_seq_max / n_stream;
     const uint32_t ng_max    = (uint32_t) layers[0].k_scalezp->ne[1];
     const uint32_t band_size = ng_max / n_seqps;
@@ -1929,6 +1934,20 @@ void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
             }
         }
     }
+}
+
+void llama_kv_cache::set_input_kpc_shift(ggml_tensor * gi_old) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(gi_old->buffer));
+    GGML_ASSERT(kpc_enabled());
+
+    const uint32_t kvs = get_size();
+
+    // all layers carry the same cell->pool map; snapshot it for the in-graph dequant
+    memcpy(gi_old->data, layers[0].group_index->data, (size_t) kvs*n_stream*sizeof(int32_t));
+
+    // rebuild group_index from the post-shift positions; the in-graph requant re-encodes every
+    // referenced pool. cursors reset and staging drops - the next write rescues the open group.
+    kpc_rebuild_group_index();
 
     std::fill(kpc_eff_offset.begin(), kpc_eff_offset.end(), 0);
     for (uint32_t slot = 0; slot < kpc_staging_slots; ++slot) {
