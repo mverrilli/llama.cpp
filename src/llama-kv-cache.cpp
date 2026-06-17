@@ -287,12 +287,17 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * staged_mask   = nullptr;
         if (has_k && type_k == GGML_TYPE_KPC4_1) {
             const int64_t ng_max = (kv_size + KPC_GROUP - 1) / KPC_GROUP;
-            // scalezp/group_index indexed per stream (ng_max pool banded per seq); staging sized by n_seq_max
+            // KPC CUDA: scalezp/k_resid/staging live on the SAME buffer as K (device when offloaded) so the
+            // device write kernel can mutate them in place and the changes persist. group_index is kept on a
+            // HOST buffer: the device path indexes scalezp POSITIONALLY (no pool map), so group_index is
+            // vestigial there and the host bookkeeping that pokes it keeps working unchanged.
+            ggml_context * ctx_m = ctx_for_buft(ggml_backend_cpu_buffer_type());
+            // scalezp indexed per stream (ng_max pools); staging sized by the staging-slot count
             k_scalezp = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(n_embd_k_gqa), ng_max, n_stream);
             ggml_format_name(k_scalezp, "cache_k_scalezp_l%d", il);
             k_resid = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, KPC_GROUP, kpc_staging_slots);
             ggml_format_name(k_resid, "cache_k_resid_l%d", il);
-            group_index = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv_size, n_stream);
+            group_index = ggml_new_tensor_2d(ctx_m, GGML_TYPE_I32, kv_size, n_stream);
             ggml_format_name(group_index, "cache_k_gidx_l%d", il);
             k_resid_slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, kpc_staging_slots);
             ggml_format_name(k_resid_slots, "cache_k_resid_slots_l%d", il);
@@ -358,10 +363,10 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
 
-        // the host writes KPC side tensors directly (staging retirement, group_index maintenance)
-        if (type_k == GGML_TYPE_KPC4_1 && !ggml_backend_buffer_is_host(buf)) {
-            throw std::runtime_error("KPC4_1 K cache requires host (CPU) KV buffers; offloaded KV cache is not supported");
-        }
+        // KPC CUDA: K, scalezp, k_resid and the staging state are device-resident and mutated in place by the
+        // CUDA write kernel, so an offloaded K cache is fully supported now. Only group_index stays on a host
+        // buffer (ctx_m above): the device path indexes scalezp positionally, so it is vestigial there and the
+        // host bookkeeping that pokes it keeps working unchanged.
 
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -635,9 +640,10 @@ void llama_kv_cache::kpc_reset_state() const {
         if (!layer.k_scalezp || !layer.group_index->data) {
             continue;
         }
-        memset(layer.group_index->data, 0xFF, ggml_nbytes(layer.group_index));   // -1: all cells unmapped
-        memset(layer.staged_mask->data,  0, ggml_nbytes(layer.staged_mask));
-        memset(layer.staged_group->data, 0, ggml_nbytes(layer.staged_group));
+        memset(layer.group_index->data, 0xFF, ggml_nbytes(layer.group_index));   // -1: all cells unmapped (host)
+        // staging lives on the (possibly device) K buffer -> use the backend memset so it works on CUDA too
+        ggml_backend_tensor_memset(layer.staged_mask,  0, 0, ggml_nbytes(layer.staged_mask));
+        ggml_backend_tensor_memset(layer.staged_group, 0, 0, ggml_nbytes(layer.staged_group));
     }
 }
 
