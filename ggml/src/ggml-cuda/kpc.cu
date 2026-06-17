@@ -84,10 +84,13 @@ static __global__ void kpc_seal_kernel(const float * in, uint8_t * nib, uint8_t 
 // mapping, positional scalezp pool = key>>5, dst output, alibi/softcap/sinks). Reference-grade single-thread
 // inner loop (warp-tile/split-K is M6). K is [head_dim, n_kv, n_kvh, ns] sliced by kv-head via k_nb2; the
 // scalezp slab carries all C_full=n_embd_k_gqa channels, so the head's slice starts at cbase=ik2*head_dim.
+// DK_T / DV_T > 0 specialize head_dim / DV at compile time so the qp[] and acc[] arrays and their loops have
+// constant bounds (register-resident, no local-memory spill). DK_T == 0 falls back to the runtime values.
+template<int DK_T, int DV_T>
 static __global__ void kpc_flash_decode_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
         const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
-        int head_dim, int DV, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
+        int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
         int rk2, int rv2, int rk3, int rv3, bool v_q41,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
         int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
@@ -101,6 +104,11 @@ static __global__ void kpc_flash_decode_kernel(
     if (iq2 >= n_head || iq1 >= n_q || iq3 >= n_stream) return;
     const int wid  = threadIdx.x >> 5;                       // warp = key-split partition (split-K)
     const int lane = threadIdx.x & 31;                       // n_split warps per (head, query, stream)
+
+    const int head_dim = DK_T ? DK_T : head_dim_rt;          // compile-time when specialized -> loops unroll
+    const int DV       = DV_T ? DV_T : DV_rt;
+    constexpr int NQP  = DK_T ? ((DK_T + 31) / 32) : 8;      // qp[] channels per lane  (head_dim <= 256)
+    constexpr int NACC = DV_T ? ((DV_T + 31) / 32) : 16;     // acc[] V elements per lane (DV <= 512)
 
     const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
     const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
@@ -119,15 +127,15 @@ static __global__ void kpc_flash_decode_kernel(
     const half  * mp   = mask ? (const half *)((const char *) mask + (size_t) iq1 * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
 
     // each lane owns DV elements {lane, lane+32, ...} of the running VKQ accumulator (registers)
-    const int ndv = (DV + 31) / 32;                          // DV <= 512 -> <= 16
-    float acc[16];
+    const int ndv = NACC;                                    // (DV+31)/32, compile-time when DV_T specialized
+    float acc[NACC];
     for (int j = 0; j < ndv; ++j) acc[j] = 0.0f;
     float m = -INFINITY, l = 0.0f;
 
     // KPC groups 32 keys under one scalezp slab, so the per-channel Q*scale fold + zp correction is constant
     // across a group: compute it once per pool (qp[] = q*scale for this lane's channels, corr = sum q*zp) and
     // reuse it for every key in the group. Per key then costs only int4 loads + a MAD (was a full re-fold/key).
-    float qp[8];                                             // head_dim <= 256 -> <= 8 channels per lane
+    float qp[NQP];                                           // q*scale per lane channel (sized at compile time)
     float corr = 0.0f;
     int   cur_pool = -1;
 
@@ -254,20 +262,26 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int    nthreads = 32 * n_split;
     const size_t smem = (n_split > 1) ? ((size_t) n_split * DV + 2 * n_split) * sizeof(float) : 0;
     dim3 grid(n_head, n_q, n_stream);
-    kpc_flash_decode_kernel<<<grid, nthreads, smem, ctx.stream()>>>(   // n_split warps per (head, query, stream)
-        (const float *) Q->data, (const uint8_t *) Kp->data, (const uint8_t *) sz->data,
-        (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr,
-        sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride,
-        params[0], params[1], params[2], (float *) dst->data,
-        head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream,
-        rk2, rv2, rk3, rv3, v_q41,
-        Q->nb[1], Q->nb[2], Q->nb[3],
-        Kp->nb[1], Kp->nb[2], Kp->nb[3],
-        sz->nb[1], sz->nb[2],
-        V->nb[1], V->nb[2], V->nb[3],
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        mask ? (int) mask->ne[2] : 1, mask ? (int) mask->ne[3] : 1,
-        dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], n_split);
+    // specialize on (head_dim, DV) so qp[]/acc[] are compile-time sized (no register spill); <0,0> = runtime.
+    #define KPC_FA_ARGS \
+        (const float *) Q->data, (const uint8_t *) Kp->data, (const uint8_t *) sz->data, \
+        (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr, \
+        sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride, \
+        params[0], params[1], params[2], (float *) dst->data, \
+        head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream, \
+        rk2, rv2, rk3, rv3, v_q41, \
+        Q->nb[1], Q->nb[2], Q->nb[3], \
+        Kp->nb[1], Kp->nb[2], Kp->nb[3], \
+        sz->nb[1], sz->nb[2], \
+        V->nb[1], V->nb[2], V->nb[3], \
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0, \
+        mask ? (int) mask->ne[2] : 1, mask ? (int) mask->ne[3] : 1, \
+        dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], n_split
+    if      (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    else                                        kpc_flash_decode_kernel<  0,  0><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    #undef KPC_FA_ARGS
 }
 
 // device write (group-parallel seal). ONE block per (logical group g, staging slot). Each block gathers the
