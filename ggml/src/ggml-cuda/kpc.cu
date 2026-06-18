@@ -468,17 +468,19 @@ static __global__ void kpc_flash_prefill_kernel(
         slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
     }
 
+    // smem: floats first (4-byte aligned from the 16-byte smem base) so the f16 tiles that follow are half2-aligned.
     extern __shared__ char kpc_smem[];
-    half  * Qf  = (half  *) kpc_smem;                // [QM][HD]
-    half  * Kf  = Qf  + KPC_QM * HD;                 // [KN][HD]
-    half  * Vf  = Kf  + KPC_KN * HD;                 // [KN][DV]
-    float * Acc = (float *)(Vf + KPC_KN * DV);       // [QM][DV]
-    float * Sc  = Acc + KPC_QM * DV;                 // [QM][KN] scores then probs
+    float * Acc = (float *) kpc_smem;                // [QM][DV]  running output accumulator
+    float * Sc  = Acc + KPC_QM * DV;                 // [QM][KN]  scores then probs
     float * scaZ= Sc  + KPC_QM * KPC_KN;             // [HD] per-channel scale (current group)
     float * zpcZ= scaZ + HD;                         // [HD] per-channel zp    (current group)
     float * Mx  = zpcZ + HD;                         // [QM] running max
     float * Ln  = Mx  + KPC_QM;                      // [QM] running denom
     float * Av  = Ln  + KPC_QM;                      // [QM] this-tile rescale a
+    half  * Qf  = (half  *)(Av + KPC_QM);            // [QM][HD] row-major
+    half  * Kf  = Qf  + KPC_QM * HD;                 // [KN][HD] row-major
+    half  * Vf  = Kf  + KPC_KN * HD;                 // [DV][KN] d-major (so the PV MMA contracts over keys)
+    half  * Pf  = Vf  + DV * KPC_KN;                 // [QM][KN] softmax probs in f16 (PV MMA operand)
 
     // load Q -> Qf (f16), zero running state + accumulator
     for (int idx = tid; idx < nqv * HD; idx += 32) {
@@ -512,22 +514,24 @@ static __global__ void kpc_flash_prefill_kernel(
                 Kf[k * HD + c] = __float2half(nibble * scaZ[c] + zpcZ[c]);
             }
         }
-        // ---- dequant V tile -> Vf (q4_1 or f16) ----
-        for (int idx = tid; idx < knv * DV; idx += 32) {
-            const int k = idx / DV, d = idx % DV;
-            const uint8_t * vrow = (const uint8_t *) V + (size_t)(kt + k) * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
-            float vv;
-            if (v_q41) {
-                const uint8_t * blk = vrow + (d / 32) * 20;
-                const float vd = __half2float(*(const half *)(blk + 0));
-                const float vm = __half2float(*(const half *)(blk + 2));
-                const int dj = d % 32;
-                const uint8_t b = blk[4 + (dj % 16)];
-                vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
-            } else {
-                vv = __half2float(((const half *) vrow)[d]);
+        // ---- dequant V tile -> Vf, D-MAJOR [d][k] (q4_1 or f16); zero padded keys so P=0 * V can't make NaN ----
+        for (int idx = tid; idx < DV * KPC_KN; idx += 32) {
+            const int d = idx / KPC_KN, k = idx % KPC_KN;
+            float vv = 0.0f;
+            if (k < knv) {
+                const uint8_t * vrow = (const uint8_t *) V + (size_t)(kt + k) * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
+                if (v_q41) {
+                    const uint8_t * blk = vrow + (d / 32) * 20;
+                    const float vd = __half2float(*(const half *)(blk + 0));
+                    const float vm = __half2float(*(const half *)(blk + 2));
+                    const int dj = d % 32;
+                    const uint8_t b = blk[4 + (dj % 16)];
+                    vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
+                } else {
+                    vv = __half2float(((const half *) vrow)[d]);
+                }
             }
-            Vf[k * DV + d] = __float2half(vv);
+            Vf[d * KPC_KN + k] = __float2half(vv);
         }
         __syncwarp();
 
@@ -587,12 +591,30 @@ static __global__ void kpc_flash_prefill_kernel(
         }
         __syncwarp();
 
-        // ---- PV: Acc[q][d] = Acc[q][d]*a + sum_k P[q][k]*Vf[k][d] (SCALAR; M3 replaces with MMA) ----
-        for (int idx = tid; idx < nqv * DV; idx += 32) {
-            const int q = idx / DV, d = idx % DV;
-            float o = Acc[q * DV + d] * Av[q];
-            for (int k = 0; k < knv; ++k) o += Sc[q * KPC_KN + k] * __half2float(Vf[k * DV + d]);
-            Acc[q * DV + d] = o;
+        // ---- PV via MMA: rescale Acc by this tile's softmax factor, then Acc[16q x DV] += P @ V (M3) ----
+        for (int idx = tid; idx < nqv * DV; idx += 32) Acc[idx] *= Av[idx / DV];   // online rescale (q<nqv)
+        __syncwarp();
+        for (int idx = tid; idx < KPC_QM * KPC_KN; idx += 32) {                    // P (probs) -> f16 operand
+            const int q = idx / KPC_KN;
+            Pf[idx] = (q < nqv) ? __float2half(Sc[idx]) : __float2half(0.0f);
+        }
+        __syncwarp();
+        {
+            using namespace ggml_cuda_mma;
+            const int kn2 = KPC_KN / 2;                                            // half2 cols (= keys/2)
+            tile<16, 8, half2> A;                                                  // P: 16 queries x KN keys
+            load_generic(A, (const half2 *) Pf, kn2);
+            #pragma unroll 1
+            for (int m = 0; m < DV / 8; ++m) {                                     // DV/8 output N-tiles of 8
+                tile<8, 8, half2> B;                                               // V: 8 d-out x KN keys (d-major)
+                load_generic(B, (const half2 *) Vf + 8 * m * kn2, kn2);
+                tile<16, 8, float> D;
+                mma(D, A, B);
+                #pragma unroll
+                for (int l = 0; l < D.ne; ++l) {
+                    Acc[D.get_i(l) * DV + 8 * m + D.get_j(l)] += D.x[l];
+                }
+            }
         }
         __syncwarp();
     }
@@ -719,7 +741,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     static const int kpc_mma = []{ const char * e = getenv("KPC_MMA"); return e ? atoi(e) : 0; }();
     if (tiled && kpc_mma) {
         dim3 gridM(n_head, (n_q + KPC_QM - 1) / KPC_QM, n_stream);
-        const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + KPC_KN * DV) * sizeof(half)
+        const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + DV * KPC_KN + KPC_QM * KPC_KN) * sizeof(half)
                             + (size_t)(KPC_QM * DV + KPC_QM * KPC_KN + 2 * head_dim + 3 * KPC_QM) * sizeof(float);
         if      (head_dim ==  64) kpc_flash_prefill_kernel< 64, 64><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
         else if (head_dim == 128) kpc_flash_prefill_kernel<128,128><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
