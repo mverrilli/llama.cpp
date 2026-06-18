@@ -424,6 +424,182 @@ static __global__ void kpc_flash_decode_qt_kernel(
     }
 }
 
+// ============================================================================
+// Tensor-core prefill path (sm_75+). Built incrementally and PPL-gated:
+//   M1 (this kernel, scalar): dequant K(int4 per-chan)+V(q4_1) into f16 smem tiles, online softmax over KN-key
+//       tiles, SCALAR f32-accumulate QK and PV. Isolates the KPC-dequant-to-smem path from MMA mechanics.
+//   M2/M3 swap the QK then PV matmuls for ggml_cuda_mma. One warp per (head, QM-query tile, stream).
+// f16 K/Q inputs with f32 accumulation mirror the f32.f16.f16.f32 MMA, so PPL should track the scalar kernel.
+// ============================================================================
+#define KPC_QM 16          // queries per block tile (MMA M dim)
+#define KPC_KN 16          // keys per inner tile
+
+template<int DK_T, int DV_T>
+static __global__ void kpc_flash_prefill_kernel(
+        const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
+        const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
+        int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
+        int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
+        int64_t sz_nb1, int64_t sz_nb2,
+        int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+        int64_t m_nb1, int64_t m_nb2, int64_t m_nb3, int m_ne2, int m_ne3,
+        int64_t dst_nb1, int dst_ne1, int dst_ne2, int n_split) {
+    const int HD = DK_T ? DK_T : head_dim_rt;
+    const int DV = DV_T ? DV_T : DV_rt;
+    const int iq2     = blockIdx.x;                  // head
+    const int iq1base = blockIdx.y * KPC_QM;         // first query of this tile
+    const int iq3     = blockIdx.z;                  // stream
+    if (iq2 >= n_head || iq1base >= n_q || iq3 >= n_stream) return;
+    const int tid = threadIdx.x;                     // single warp: 0..31
+
+    const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
+    const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
+    const int cbase = ik2 * HD;
+    const int nqv = (n_q - iq1base) < KPC_QM ? (n_q - iq1base) : KPC_QM;   // valid queries (tail)
+
+    float slope = 1.0f;
+    if (max_bias > 0.0f) {
+        const int n_head_log2 = 1 << (int) floorf(log2f((float) n_head));
+        const float m0 = exp2f(-(max_bias)        / n_head_log2);
+        const float m1 = exp2f(-(max_bias / 2.0f) / n_head_log2);
+        slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
+    }
+
+    extern __shared__ char kpc_smem[];
+    half  * Qf  = (half  *) kpc_smem;                // [QM][HD]
+    half  * Kf  = Qf  + KPC_QM * HD;                 // [KN][HD]
+    half  * Vf  = Kf  + KPC_KN * HD;                 // [KN][DV]
+    float * Acc = (float *)(Vf + KPC_KN * DV);       // [QM][DV]
+    float * Sc  = Acc + KPC_QM * DV;                 // [QM][KN] scores then probs
+    float * scaZ= Sc  + KPC_QM * KPC_KN;             // [HD] per-channel scale (current group)
+    float * zpcZ= scaZ + HD;                         // [HD] per-channel zp    (current group)
+    float * Mx  = zpcZ + HD;                         // [QM] running max
+    float * Ln  = Mx  + KPC_QM;                      // [QM] running denom
+    float * Av  = Ln  + KPC_QM;                      // [QM] this-tile rescale a
+
+    // load Q -> Qf (f16), zero running state + accumulator
+    for (int idx = tid; idx < nqv * HD; idx += 32) {
+        const int q = idx / HD, c = idx % HD;
+        const float * qr = (const float *)((const char *) Q + (size_t)(iq1base + q) * q_nb1 + (size_t) iq2 * q_nb2 + (size_t) iq3 * q_nb3);
+        Qf[q * HD + c] = __float2half(qr[c]);
+    }
+    for (int q = tid; q < KPC_QM; q += 32) { Mx[q] = -INFINITY; Ln[q] = 0.0f; }
+    for (int idx = tid; idx < KPC_QM * DV; idx += 32) Acc[idx] = 0.0f;
+    __syncwarp();
+
+    for (int kt = 0; kt < n_kv; kt += KPC_KN) {
+        const int knv = (n_kv - kt) < KPC_KN ? (n_kv - kt) : KPC_KN;
+        // ---- dequant K tile -> Kf (per-channel: nibble*scale + zp; group scale/zp cached in smem) ----
+        int tile_pool = -1;
+        for (int k = 0; k < knv; ++k) {
+            const int key = kt + k;
+            int pool = gid ? gid[(size_t) ik3 * gi_stride + key] : (key / GGML_KPC_GROUP);
+            if (pool < 0) pool = 0;
+            if (pool != tile_pool) {
+                const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
+                float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
+                const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+                for (int c = tid; c < HD; c += 32) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
+                __syncwarp(); tile_pool = pool;
+            }
+            const uint8_t * krow = (const uint8_t *) Kp + (size_t) key * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
+            for (int c = tid; c < HD; c += 32) {
+                const uint8_t nb = krow[c >> 1];
+                const float nibble = (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F));
+                Kf[k * HD + c] = __float2half(nibble * scaZ[c] + zpcZ[c]);
+            }
+        }
+        // ---- dequant V tile -> Vf (q4_1 or f16) ----
+        for (int idx = tid; idx < knv * DV; idx += 32) {
+            const int k = idx / DV, d = idx % DV;
+            const uint8_t * vrow = (const uint8_t *) V + (size_t)(kt + k) * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
+            float vv;
+            if (v_q41) {
+                const uint8_t * blk = vrow + (d / 32) * 20;
+                const float vd = __half2float(*(const half *)(blk + 0));
+                const float vm = __half2float(*(const half *)(blk + 2));
+                const int dj = d % 32;
+                const uint8_t b = blk[4 + (dj % 16)];
+                vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
+            } else {
+                vv = __half2float(((const half *) vrow)[d]);
+            }
+            Vf[k * DV + d] = __float2half(vv);
+        }
+        __syncwarp();
+
+        // ---- QK: Sc[q][k] = f32 dot(Qf[q], Kf[k]) (SCALAR; M2 replaces with MMA) ----
+        for (int idx = tid; idx < KPC_QM * KPC_KN; idx += 32) {
+            const int q = idx / KPC_KN, k = idx % KPC_KN;
+            if (q >= nqv || k >= knv) { Sc[idx] = 0.0f; continue; }
+            float acc = 0.0f;
+            for (int c = 0; c < HD; ++c) acc += __half2float(Qf[q * HD + c]) * __half2float(Kf[k * HD + c]);
+            Sc[idx] = acc;
+        }
+        __syncwarp();
+
+        // ---- per-query online-softmax update (lane q owns query q) ----
+        if (tid < nqv) {
+            const int q = tid;
+            const int qpos = iq1base + q;
+            const half * mp = mask ? (const half *)((const char *) mask + (size_t) qpos * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
+            float tilemax = -INFINITY;
+            float proc[KPC_KN];
+            for (int k = 0; k < knv; ++k) {
+                const int key = kt + k;
+                float sc = Sc[q * KPC_KN + k] * kqscale;
+                if (logit_softcap != 0.0f) sc = logit_softcap * tanhf(sc / logit_softcap);
+                const float mv = mp ? __half2float(mp[key]) : 0.0f;
+                sc += slope * mv;
+                proc[k] = sc;
+                tilemax = fmaxf(tilemax, sc);
+            }
+            const float mn = fmaxf(Mx[q], tilemax);
+            const float a  = expf(Mx[q] - mn);
+            float sump = 0.0f;
+            for (int k = 0; k < knv; ++k) { const float p = expf(proc[k] - mn); Sc[q * KPC_KN + k] = p; sump += p; }
+            for (int k = knv; k < KPC_KN; ++k) Sc[q * KPC_KN + k] = 0.0f;
+            Ln[q] = Ln[q] * a + sump;
+            Mx[q] = mn;
+            Av[q] = a;
+        }
+        __syncwarp();
+
+        // ---- PV: Acc[q][d] = Acc[q][d]*a + sum_k P[q][k]*Vf[k][d] (SCALAR; M3 replaces with MMA) ----
+        for (int idx = tid; idx < nqv * DV; idx += 32) {
+            const int q = idx / DV, d = idx % DV;
+            float o = Acc[q * DV + d] * Av[q];
+            for (int k = 0; k < knv; ++k) o += Sc[q * KPC_KN + k] * __half2float(Vf[k * DV + d]);
+            Acc[q * DV + d] = o;
+        }
+        __syncwarp();
+    }
+
+    // ---- attention sink (fold once per query) + write normalized output ----
+    if (tid < nqv) {
+        const int q = tid;
+        if (sinks) {
+            const float sk = sinks[iq2];
+            const float mn = fmaxf(Mx[q], sk), a = expf(Mx[q] - mn), p = expf(sk - mn);
+            Ln[q] = Ln[q] * a + p;
+            Av[q] = a;   // reuse Av to carry the sink rescale for Acc below
+            Mx[q] = mn;
+        } else {
+            Av[q] = 1.0f;
+        }
+    }
+    __syncwarp();
+    for (int idx = tid; idx < nqv * DV; idx += 32) {
+        const int q = idx / DV, d = idx % DV;
+        const float Sinv = (Ln[q] == 0.0f) ? 0.0f : 1.0f / Ln[q];
+        const int iq1 = iq1base + q;
+        float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
+        out[d] = Acc[q * DV + d] * Av[q] * Sinv;
+    }
+}
+
 // ---- host wrappers (thin launchers; exercised once M3 wires the GPU-native tensors) ----
 
 void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -519,7 +695,17 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 gridR = (kv_split > 1) ? dim3(n_head, kv_split, n_stream) : grid;
     #define KPC_FA_DEC , parts, meta, kv_split
 
-    if (tiled) {
+    // tensor-core prefill path (dev-gated behind KPC_MMA while milestones M1..M4 land; default keeps query-tiled).
+    static const int kpc_mma = []{ const char * e = getenv("KPC_MMA"); return e ? atoi(e) : 0; }();
+    if (tiled && kpc_mma) {
+        dim3 gridM(n_head, (n_q + KPC_QM - 1) / KPC_QM, n_stream);
+        const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + KPC_KN * DV) * sizeof(half)
+                            + (size_t)(KPC_QM * DV + KPC_QM * KPC_KN + 2 * head_dim + 3 * KPC_QM) * sizeof(float);
+        if      (head_dim ==  64) kpc_flash_prefill_kernel< 64, 64><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+        else if (head_dim == 128) kpc_flash_prefill_kernel<128,128><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+        else                      kpc_flash_prefill_kernel<256,256><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+    }
+    else if (tiled) {
         const int QT = 3;
         dim3 gridT(n_head, (n_q + QT - 1) / QT, n_stream);
         if      (head_dim ==  64) kpc_flash_decode_qt_kernel< 64, 64, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
