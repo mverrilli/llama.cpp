@@ -2451,7 +2451,8 @@ extern "C" {
             struct ggml_tensor  * sinks,
             float                 kq_scale,
             float                 max_bias,
-            float                 logit_softcap);
+            float                 logit_softcap,
+            int32_t               n_seq_max);
 
     // in-place residual-staged per-channel int4 K write; scatter placement from k_idxs, groups by logical pos/32
     // (kpc_seq/kpc_pos are per-token graph inputs driving the per-sequence (seq,group) pool assignment)

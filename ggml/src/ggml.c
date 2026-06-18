@@ -5444,7 +5444,8 @@ struct ggml_tensor * ggml_kpc_attn(
         struct ggml_tensor  * sinks,
         float                 kq_scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        int32_t               n_seq_max) {
     if (max_bias > 0.0f) {
         GGML_ASSERT(mask);
     }
@@ -5456,7 +5457,10 @@ struct ggml_tensor * ggml_kpc_attn(
     const int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    float params[] = { kq_scale, max_bias, logit_softcap };
+    // params[3] = n_seq_max: with >1 sequence in the cache the CUDA decode uses single-warp (deterministic) attention
+    // so a per-sequence state restore / continuous batching can't perturb the OTHER sequences via split-K
+    // reduction-order drift across context instances. Single-stream inference keeps the split-K occupancy path.
+    float params[] = { kq_scale, max_bias, logit_softcap, (float) n_seq_max };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_KPC_FLASH_ATTN;

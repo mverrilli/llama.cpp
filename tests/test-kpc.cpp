@@ -264,7 +264,7 @@ static int test_attn(int n_threads) {
         gxd[i] = (int32_t) (i / KPC_GROUP);   // contiguous: slot -> group = slot/32
     }
 
-    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f);
+    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f, 1);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, o);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -394,7 +394,7 @@ static int test_attn_extras(int n_threads, float softcap, bool use_sinks, float 
         gxd[i] = (int32_t)(i / KPC_GROUP);   // group_index = slot/KPC_GROUP
     }
 
-    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, skt, 1.0f, max_bias, softcap);
+    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, skt, 1.0f, max_bias, softcap, 1);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, o);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -1126,7 +1126,7 @@ static int test_attn_gqa_grouping(void) {
         int32_t * gxd = (int32_t *) gx->data;
         for (int64_t i = 0; i < NKV; ++i) gxd[i] = (int32_t)(i / KPC_GROUP);
 
-        struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, szt, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f);
+        struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, szt, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, o);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);

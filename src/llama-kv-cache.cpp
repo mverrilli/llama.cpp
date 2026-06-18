@@ -155,7 +155,15 @@ llama_kv_cache::llama_kv_cache(
     if (const char * e = getenv("KPC_STAGING_SLOTS")) {
         const long v = atol(e);
         if (v >= 1 && v < (long) n_seq_max) {
-            kpc_staging_slots = (uint32_t) v;
+            // virtualized staging is a CPU-only feature: the CUDA write/read kernels hardcode slot==seq (positional
+            // pools) and never maintain group_index for it, so an offloaded virtualized cache silently corrupts
+            // state save/restore. Honor the env only on a host (CPU) KV cache; otherwise keep slot==seq.
+            if (!offload) {
+                kpc_staging_slots = (uint32_t) v;
+            } else {
+                LLAMA_LOG_WARN("%s: KPC_STAGING_SLOTS=%ld ignored: virtualized staging is unsupported with offloaded "
+                               "(GPU) KV; using %u slots (slot==seq)\n", __func__, v, n_seq_max);
+            }
         }
     }
     kpc_seq2slot.assign(n_seq_max, -1);
@@ -2694,7 +2702,8 @@ namespace {
             qs[c] = (uint8_t) s; qz[c] = (uint8_t) z;
         }
     }
-    // Stage 2 RAW fast path: per-seq save stores int4-K + scalezp verbatim (compact, bit-exact) for groups.
+    // Stage 2 RAW fast path: when enabled, per-seq save stores int4-K + scalezp verbatim (compact, bit-exact)
+    // for groups, falling back to the DEQUANT f16 path on a misaligned restore. Default off (Stage 1 behavior).
     inline bool kpc_seq_raw_enabled() {
         // Default ON: RAW stores int4-K + scalezp verbatim -> per-seq restore is BIT-EXACT (the DEQUANT path
         // re-quantizes and is lossy ~0.1-0.6 logits). KPC_SEQ_RAW=0 forces the old f16 dequant path.
@@ -2791,12 +2800,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 }
             }
             // Save this sequence's OPEN-group staging: staged_group + staged_mask + the exact (pre-quant f16)
-            // residual window, so a continuing decode after restore re-seals the partial last group bit-faithfully.
-            // (The whole-cache staging serialize is skipped for kpc_seq; this carries the open group per-sequence.)
+            // residual window. The restore re-seals the partial last group with these, so a continuing decode is
+            // bit-faithful. The whole-cache staging serialize below is skipped for kpc_seq; this carries it per-seq.
             {
                 const int slot = kpc_virtualized()
                     ? (seq_id < (int) kpc_seq2slot.size() ? kpc_seq2slot[seq_id] : -1) : (int) seq_id;
-                const int64_t GxC = G * C;
+                const int64_t GxC = (int64_t) GGML_KPC_GROUP * C;
                 int32_t sgv = -1, smv = 0;
                 std::vector<ggml_fp16_t> resid((size_t) GxC, ggml_fp32_to_fp16(0.0f));
                 if (slot >= 0) {
@@ -3201,8 +3210,13 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     }
                 }
             }
-            if (kdev) {   // flush the re-quantized K + scalezp back to the device cache
-                ggml_backend_tensor_set(k, k_host.data(), 0, ggml_nbytes(k));
+            if (kdev) {   // flush ONLY this sequence's cells + scalezp back to the device. Writing back the WHOLE
+                          // staged K tensor perturbed other sequences' device cells (an undisturbed seq drifted by
+                          // ~0.2 logits) -- scatter just the restored cells.
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    const size_t off = (size_t) sinfo.idxs[0][i] * krow;
+                    ggml_backend_tensor_set(k, k_host.data() + off, off, krow);
+                }
                 ggml_backend_tensor_set(sz, sz_host.data(), (size_t) strm * sz_stream, sz_stream);
             }
             // Restore the OPEN-group staging the save emitted: the EXACT pre-quant f16 residual + staged_group/mask,
@@ -3210,7 +3224,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             // remapped to the dst cells (the restore may land the sequence at different cells than it was saved from).
             {
                 int32_t sgv = -1, smv = 0;
-                const int64_t GxC = G * C;
+                const int64_t GxC = (int64_t) G * C;
                 std::vector<ggml_fp16_t> resid((size_t) GxC, ggml_fp32_to_fp16(0.0f));
                 io.read(&sgv, sizeof(sgv));
                 io.read(&smv, sizeof(smv));
@@ -3221,10 +3235,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                     std::vector<int32_t> rslots(G, 0);
                     for (int64_t i = 0; i < cell_count; ++i) {     // map each staged within-group slot to its dst cell
                         const uint32_t idx = sinfo.idxs[0][i];
-                        const int32_t  pos = cells.pos_get(idx);
+                        const int32_t  pos = v_cells[strm].pos_get(idx);
                         if (pos / (int32_t) G != sgv) continue;
                         const int32_t w = pos % (int32_t) G;
-                        if (smv & (1 << w)) rslots[w] = (int32_t) idx;
+                        // On the device cache the CUDA seal kernel addresses cells GLOBALLY (stream*kv_size + local),
+                        // so resid_slots must carry the stream offset or the re-seal scatters the staged open-group
+                        // members into stream 0 while the new token lands in the seq's real stream. The host cache
+                        // uses per-stream-local cell indices, so it must NOT add the offset.
+                        if (smv & (1 << w)) rslots[w] = (int32_t) (kdev ? ((size_t) strm * get_size() + idx) : (size_t) idx);
                     }
                     ggml_backend_tensor_set(layer.k_resid,       resid.data(),  (size_t) slot * GxC * sizeof(ggml_fp16_t), (size_t) GxC * sizeof(ggml_fp16_t));
                     ggml_backend_tensor_set(layer.k_resid_slots, rslots.data(), (size_t) slot * G * sizeof(int32_t),       (size_t) G * sizeof(int32_t));

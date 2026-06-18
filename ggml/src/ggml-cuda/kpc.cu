@@ -22,6 +22,11 @@ static __device__ __forceinline__ float kpc_deq_nib(uint8_t nb, int c, float s, 
     return q * s + z;
 }
 
+// largest power of two <= n (ALiBi n_head_log2). Integer form: GPU log2f(2^k) can round to just under k, and
+// floorf() then truncates to k-1 -> a wrong slope for power-of-2 head counts (e.g. n_head=16 -> 8). The host fattn
+// path dodges this by computing on the CPU; KPC computes the slope in-kernel, so it must be exact here.
+static __device__ __forceinline__ int kpc_pow2_floor(int n) { int p = 1; while ((p << 1) <= n) p <<= 1; return p; }
+
 static __device__ __forceinline__ void kpc_pack_nib(uint8_t * row, int c, float v, float s, float z) {
     int qv = (int)((v - z) / s + 0.5f);
     qv = qv < 0 ? 0 : (qv > 15 ? 15 : qv);
@@ -123,7 +128,7 @@ static __global__ void kpc_flash_decode_kernel(
     // ALiBi slope (max_bias==0 -> 1).
     float slope = 1.0f;
     if (max_bias > 0.0f) {
-        const int n_head_log2 = 1 << (int) floorf(log2f((float) n_head));
+        const int n_head_log2 = kpc_pow2_floor(n_head);
         const float m0 = exp2f(-(max_bias)        / n_head_log2);
         const float m1 = exp2f(-(max_bias / 2.0f) / n_head_log2);
         slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
@@ -319,7 +324,7 @@ static __global__ void kpc_flash_decode_qt_kernel(
 
     float slope = 1.0f;
     if (max_bias > 0.0f) {
-        const int n_head_log2 = 1 << (int) floorf(log2f((float) n_head));
+        const int n_head_log2 = kpc_pow2_floor(n_head);
         const float m0 = exp2f(-(max_bias)        / n_head_log2);
         const float m1 = exp2f(-(max_bias / 2.0f) / n_head_log2);
         slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
@@ -464,7 +469,7 @@ static __global__ void kpc_flash_prefill_kernel(
 
     float slope = 1.0f;
     if (max_bias > 0.0f) {
-        const int n_head_log2 = 1 << (int) floorf(log2f((float) n_head));
+        const int n_head_log2 = kpc_pow2_floor(n_head);
         const float m0 = exp2f(-(max_bias)        / n_head_log2);
         const float m1 = exp2f(-(max_bias / 2.0f) / n_head_log2);
         slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
@@ -647,7 +652,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * mask  = dst->src[4];
     const ggml_tensor * gi    = dst->src[5];   // group_index [n_kv, ns] (cell->pool); null -> positional
     const ggml_tensor * sinks = dst->src[6];
-    float params[3]; memcpy(params, dst->op_params, sizeof(params));   // kq_scale, max_bias, logit_softcap
+    float params[4]; memcpy(params, dst->op_params, sizeof(params));   // kq_scale, max_bias, logit_softcap, n_seq_max
 
     const int head_dim = Q->ne[0];
     const int n_q      = Q->ne[1];
@@ -677,6 +682,26 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
            (size_t)((n_split * 2) * DV + 2 * (n_split * 2)) * sizeof(float) <= 48 * 1024 && // dynamic-smem budget
            blocks * (n_split * 2) <= 2048 &&                                                // don't oversubscribe
            (n_split * 2) <= n_kv) n_split *= 2;
+    // register-file cap: 32*n_split threads must fit the SM's 64K-register/block file. Large head_dim kernels
+    // (DV=256 uses ~72 regs/thread) blow past it at n_split=32 (1024 thr) -> "too many resources requested for
+    // launch". maxThreadsPerBlock is the driver's register-derived ceiling for the chosen instantiation; shrink
+    // n_split to fit it (head_dim 64/128 keep 32 warps; 256 backs off).
+    if (n_split > 1) {
+        cudaFuncAttributes fa{};
+        cudaError_t fe;
+        if      (head_dim == DV && head_dim ==  64) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel< 64, 64>);
+        else if (head_dim == DV && head_dim == 128) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<128,128>);
+        else if (head_dim == DV && head_dim == 256) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<256,256>);
+        else                                        fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<  0,  0>);
+        if (fe == cudaSuccess && fa.maxThreadsPerBlock > 0)
+            while (n_split > 1 && 32 * n_split > fa.maxThreadsPerBlock) n_split /= 2;
+    }
+    // Determinism gate: split-K's per-warp partition + combine is not bit-reproducible across SEPARATE context
+    // instances, so when the cache holds >1 sequence (state restore / continuous batching) a restored or sibling
+    // sequence could see another sequence's decode drift by ~0.2 logits. Fall back to single-warp (deterministic)
+    // decode there. Single-stream inference (n_seq_max==1) keeps the split-K occupancy path. Env override for A/B.
+    const int n_seq_max = (int) params[3];
+    if ((n_seq_max > 1 && !getenv("KPC_FORCE_SPLITK")) || getenv("KPC_NSPLIT1")) n_split = 1;
     const int    nthreads = 32 * n_split;
     const size_t smem = (n_split > 1) ? ((size_t) n_split * DV + 2 * n_split) * sizeof(float) : 0;
     dim3 grid(n_head, n_q, n_stream);
@@ -822,7 +847,11 @@ static __global__ void kpc_write_kernel(
         const half * k_resid, uint8_t * scalezp, const int32_t * resid_slots,
         const int32_t * staged_group, const int32_t * staged_mask,
         uint8_t * K, int C, int nt, int slot_shift, int seq_mask, int L,
-        int n_seqps, int band_size, int64_t sz_nb1, int64_t sz_nb2, int64_t k_nb1) {
+        int n_seqps, int band_size, int64_t sz_nb1, int64_t sz_nb2, int64_t k_nb1,
+        int64_t kc_nb0, int64_t kc_nb1) {
+    // k_cur may be a non-contiguous view (e.g. ALiBi models have no RoPE op to repack K) -> read it via strides,
+    // mirroring the CPU write. Reading it as flat [tok*C+c] silently grabs wrong channels -> inflated seal range.
+    #define KPC_KC(tk, ch) (*(const float *)((const char *) k_cur + (size_t)(tk)*kc_nb1 + (size_t)(ch)*kc_nb0))
     const int g    = blockIdx.x;     // logical 32-token group
     const int slot = blockIdx.y;     // staging slot (== seq for the supported non-virtualized cache)
     if (slot >= L) return;
@@ -850,7 +879,7 @@ static __global__ void kpc_write_kernel(
         float mn = INFINITY, mx = -INFINITY;
         for (int w = 0; w < GGML_KPC_GROUP; ++w) {
             if (!(members & (1u << w))) continue;
-            float v = (newmask & (1u << w)) ? k_cur[(size_t) tok_of[w] * C + c]
+            float v = (newmask & (1u << w)) ? KPC_KC(tok_of[w], c)
                                             : __half2float(rsd[(size_t) w * C + c]);
             mn = fminf(mn, v); mx = fmaxf(mx, v);
         }
@@ -883,8 +912,8 @@ static __global__ void kpc_write_kernel(
         uint8_t * row = K + (size_t) cell * k_nb1;
         for (int b = threadIdx.x; b < krow; b += blockDim.x) {
             const int c0 = 2 * b, c1 = 2 * b + 1;
-            float v0 = isnew ? k_cur[(size_t) tok_of[w] * C + c0] : __half2float(rsd[(size_t) w * C + c0]);
-            float v1 = isnew ? k_cur[(size_t) tok_of[w] * C + c1] : __half2float(rsd[(size_t) w * C + c1]);
+            float v0 = isnew ? KPC_KC(tok_of[w], c0) : __half2float(rsd[(size_t) w * C + c0]);
+            float v1 = isnew ? KPC_KC(tok_of[w], c1) : __half2float(rsd[(size_t) w * C + c1]);
             int q0 = (int)((v0 - (zmn + qz[c0]*sz)) / (qs[c0]*ss) + 0.5f);
             int q1 = (int)((v1 - (zmn + qz[c1]*sz)) / (qs[c1]*ss) + 0.5f);
             q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
@@ -901,7 +930,7 @@ static __global__ void kpc_write_kernel(
 static __global__ void kpc_write_stage_kernel(
         const float * k_cur, const int32_t * kpc_seq, const int32_t * kpc_pos, const int64_t * k_idxs,
         half * k_resid, int32_t * resid_slots, int32_t * staged_group, int32_t * staged_mask,
-        int C, int nt, int slot_shift, int L) {
+        int C, int nt, int slot_shift, int L, int64_t kc_nb0, int64_t kc_nb1) {
     const int g    = blockIdx.x;
     const int slot = blockIdx.y;
     if (slot >= L) return;
@@ -920,7 +949,7 @@ static __global__ void kpc_write_stage_kernel(
     half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
     for (int w = 0; w < GGML_KPC_GROUP; ++w) {
         if (!(newmask & (1u << w))) continue;                  // staged members already have residual + slot
-        for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(k_cur[(size_t) tok_of[w] * C + c]);
+        for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(KPC_KC(tok_of[w], c));
         if (threadIdx.x == 0) resid_slots[slot * GGML_KPC_GROUP + w] = (int32_t) cell_of[w];
     }
     if (threadIdx.x == 0) { staged_group[slot] = g; staged_mask[slot] = (int32_t) members; }
@@ -952,15 +981,16 @@ void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         (const int64_t *) k_idxs->data, (half *) k_resid->data, (uint8_t *) scalezp->data,
         (int32_t *) rslots->data, (int32_t *) sgrp->data, (int32_t *) smask->data, (uint8_t *) dst->data,
         C, nt, GGML_KPC_SLOT_SHIFT, GGML_KPC_SEQ_MASK, L,
-        n_seqps, band_size, scalezp->nb[1], scalezp->nb[2], dst->nb[1]);
+        n_seqps, band_size, scalezp->nb[1], scalezp->nb[2], dst->nb[1], k_cur->nb[0], k_cur->nb[1]);
     // SECOND launch: persist the staging window. Serialized after the seal on the same stream, so the seal's
     // reads of the OLD staging are done before this writes the NEW staging -> no inter-block staging race.
     kpc_write_stage_kernel<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) k_cur->data, (const int32_t *) kseq->data, (const int32_t *) kpos->data,
         (const int64_t *) k_idxs->data, (half *) k_resid->data,
         (int32_t *) rslots->data, (int32_t *) sgrp->data, (int32_t *) smask->data,
-        C, nt, GGML_KPC_SLOT_SHIFT, L);
+        C, nt, GGML_KPC_SLOT_SHIFT, L, k_cur->nb[0], k_cur->nb[1]);
 }
+#undef KPC_KC
 
 // ---- dequant: packed int4 K [C,n_kv,ns] -> f16, positional pool = cell>>5 per stream (RoPE shift / state) ----
 static __global__ void kpc_dequant_kernel(
@@ -1050,8 +1080,10 @@ static __global__ void kpc_requant_kernel(
         uint8_t     * row = pk + (size_t) s * k_nb2 + (size_t) i * k_nb1;
         const float * rc  = (const float *)((const char *) rbase + (size_t) i * r_nb1);
         for (int b = threadIdx.x; b < krow; b += blockDim.x) {
-            int q0 = (int)((rc[2*b]   - (zmn + qz[2*b]  *sz)) / (qs[2*b]  *ss) + 0.5f);
-            int q1 = (int)((rc[2*b+1] - (zmn + qz[2*b+1]*sz)) / (qs[2*b+1]*ss) + 0.5f);
+            float d0 = qs[2*b]  *ss; if (d0 == 0.0f) d0 = 1.0f;   // match CPU requant: tiny scale underflows to 0 (kpc.cpp)
+            float d1 = qs[2*b+1]*ss; if (d1 == 0.0f) d1 = 1.0f;
+            int q0 = (int)((rc[2*b]   - (zmn + qz[2*b]  *sz)) / d0 + 0.5f);
+            int q1 = (int)((rc[2*b+1] - (zmn + qz[2*b+1]*sz)) / d1 + 0.5f);
             q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
             q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
             row[b] = (uint8_t)(q0 | (q1 << 4));
