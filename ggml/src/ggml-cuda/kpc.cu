@@ -514,8 +514,21 @@ static __global__ void kpc_flash_prefill_kernel(
     __syncthreads();
     KPC_PROF(0);
 
+    // top query of this tile and its causal key horizon: keys past it are future for every query in the tile.
+    const int qtop    = iq1base + nqv - 1;
+    const int qmaxpos = (n_kv - n_q) + qtop;            // n_kv-n_q = n_past; query qtop attends to keys <= this
     for (int kt = 0; kt < n_kv; kt += KPC_KN) {
         const int knv = (n_kv - kt) < KPC_KN ? (n_kv - kt) : KPC_KN;
+        // Causal/SWA fully-masked-tile skip: if this key-tile starts past the top query's horizon it is future for
+        // every (query,key) in the tile and contributes exactly 0 (mask = -inf -> exp = 0). The skip is uniform
+        // across the block (depends only on kt and tile constants) so the barriers stay matched, and is bit-identical.
+        // Guard with the mask value at (top query, kt): for a causal-family mask that corner being -inf proves the
+        // whole future tile is masked; for a (hypothetical) non-causal mask the corner is finite so we never skip.
+        if (mask && kt > qmaxpos) {
+            const half * mtop = (const half *)((const char *) mask + (size_t) qtop * m_nb1
+                              + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3);
+            if (__half2float(mtop[kt]) == -INFINITY) continue;
+        }
         // ---- dequant K tile -> Kf (per-channel: nibble*scale + zp; group scale/zp cached in smem) ----
         // Positional tiles (gid==null) are always single-pool (GROUP=32, KN=16, 16-aligned kt); gid tiles are too
         // when the cell->pool map is positional. Single-pool => dequant K over a FLAT (key,channel) grid-stride loop:
