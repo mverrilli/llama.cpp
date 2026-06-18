@@ -97,10 +97,15 @@ static __global__ void kpc_flash_decode_kernel(
         int64_t sz_nb1, int64_t sz_nb2,
         int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
         int64_t m_nb1, int64_t m_nb2, int64_t m_nb3, int m_ne2, int m_ne3,
-        int64_t dst_nb1, int dst_ne1, int dst_ne2, int n_split) {
+        int64_t dst_nb1, int dst_ne1, int dst_ne2, int n_split,
+        float * parts, float2 * meta_out, int kv_split) {
     const int iq2 = blockIdx.x;   // query head
-    const int iq1 = blockIdx.y;   // query position
-    const int iq3 = blockIdx.z;   // stream
+    // grid-level split-K (decode only): when kv_split>1, blockIdx.y is the KV super-block index and there is a
+    // single query (iq1=0); the block reduces its KV slice to a partial that a combine kernel finishes. When
+    // kv_split==1, blockIdx.y is the query position (original behaviour) and the block writes dst directly.
+    const int kv_g = (kv_split > 1) ? blockIdx.y : 0;
+    const int iq1  = (kv_split > 1) ? 0          : (int) blockIdx.y;   // query position
+    const int iq3  = blockIdx.z;   // stream
     if (iq2 >= n_head || iq1 >= n_q || iq3 >= n_stream) return;
     const int wid  = threadIdx.x >> 5;                       // warp = key-split partition (split-K)
     const int lane = threadIdx.x & 31;                       // n_split warps per (head, query, stream)
@@ -139,7 +144,11 @@ static __global__ void kpc_flash_decode_kernel(
     float corr = 0.0f;
     int   cur_pool = -1;
 
-    for (int t = wid; t < n_kv; t += n_split) {              // split-K: warp wid owns keys {wid, wid+n_split, ...}
+    // this block owns the KV slice [kv_lo, kv_hi); kv_split==1 -> the whole cache (original behaviour).
+    const int kv_slice = (n_kv + kv_split - 1) / kv_split;
+    const int kv_lo    = kv_g * kv_slice;
+    const int kv_hi    = (kv_lo + kv_slice < n_kv) ? (kv_lo + kv_slice) : n_kv;
+    for (int t = kv_lo + wid; t < kv_hi; t += n_split) {    // split-K: warp wid owns keys {kv_lo+wid, +n_split, ...}
         const float mv = mp ? __half2float(mp[t]) : 0.0f;
         if (mp && mv == -INFINITY) continue;                 // same for every lane -> no warp divergence
         int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);   // cell->pool (positional if no map)
@@ -190,9 +199,10 @@ static __global__ void kpc_flash_decode_kernel(
         }
         m = mn;
     }
-    // attention sink: fold the per-head sink logit into the denominator once (on warp 0 only, so it is
-    // counted a single time across the split). No V contribution.
-    if (sinks && wid == 0) {
+    // attention sink: fold the per-head sink logit into the denominator once. With grid-split only the g==0
+    // block folds it (still on warp 0), so the sink is counted exactly once across all partials and the combine
+    // kernel stays sink-agnostic. No V contribution.
+    if (sinks && wid == 0 && (kv_split == 1 || kv_g == 0)) {
         const float sk = sinks[iq2];
         const float mn = fmaxf(m, sk), a = expf(m - mn), p = expf(sk - mn);
         l = l * a + p;
@@ -200,10 +210,19 @@ static __global__ void kpc_flash_decode_kernel(
         m = mn;
     }
 
+    // grid-split (kv_split>1): each block emits an un-normalised numerator + (m,l) meta into transient scratch
+    // at part_idx; the combine kernel renormalises across the kv_split blocks. kv_split==1: write dst directly.
+    const size_t part_idx = (size_t)(iq3 * n_head + iq2) * kv_split + kv_g;
     float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
-    if (n_split == 1) {                                             // single warp -> emit directly, no reduction
-        const float Sinv = (l == 0.0f) ? 0.0f : 1.0f / l;
-        for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[j] * Sinv; }
+    if (n_split == 1) {                                             // single warp -> block result is this warp's
+        if (kv_split == 1) {
+            const float Sinv = (l == 0.0f) ? 0.0f : 1.0f / l;
+            for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[j] * Sinv; }
+        } else {
+            float * pb = parts + part_idx * DV;
+            for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) pb[d] = acc[j]; }
+            if (lane == 0) meta_out[part_idx] = make_float2(m, l);
+        }
         return;
     }
 
@@ -220,11 +239,47 @@ static __global__ void kpc_flash_decode_kernel(
     for (int w = 0; w < n_split; ++w) m_g = fmaxf(m_g, s_m[w]);
     float l_g = 0.0f;
     for (int w = 0; w < n_split; ++w) l_g += (s_m[w] == -INFINITY) ? 0.0f : s_l[w] * expf(s_m[w] - m_g);
-    const float Sinv = (l_g == 0.0f) ? 0.0f : 1.0f / l_g;
+    if (kv_split == 1) {
+        const float Sinv = (l_g == 0.0f) ? 0.0f : 1.0f / l_g;
+        for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+            float a = 0.0f;
+            for (int w = 0; w < n_split; ++w) a += (s_m[w] == -INFINITY) ? 0.0f : s_acc[(size_t) w * DV + d] * expf(s_m[w] - m_g);
+            out[d] = a * Sinv;
+        }
+    } else {
+        float * pb = parts + part_idx * DV;                        // un-normalised numerator; combine renormalises
+        for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+            float a = 0.0f;
+            for (int w = 0; w < n_split; ++w) a += (s_m[w] == -INFINITY) ? 0.0f : s_acc[(size_t) w * DV + d] * expf(s_m[w] - m_g);
+            pb[d] = a;
+        }
+        if (threadIdx.x == 0) meta_out[part_idx] = make_float2(m_g, l_g);
+    }
+}
+
+// ---- grid-split combine: renormalise the kv_split per-block partials (numerator + (m,l) meta) into dst with
+// an online-softmax rescale. One block per (head, stream); DV threads. Mirrors flash_attn_combine_results. ----
+template<int DV_T>
+static __global__ void kpc_flash_combine_kernel(
+        const float * parts, const float2 * meta_out, float * dst,
+        int kv_split, int n_head, int DV_rt, int64_t dst_nb1, int dst_ne1, int dst_ne2) {
+    const int iq2 = blockIdx.x;   // head
+    const int iq3 = blockIdx.y;   // stream
+    const int DV  = DV_T ? DV_T : DV_rt;
+    const size_t base = (size_t)(iq3 * n_head + iq2) * kv_split;
+    extern __shared__ float2 s_meta[];                             // [kv_split]
+    for (int i = threadIdx.x; i < kv_split; i += blockDim.x) s_meta[i] = meta_out[base + i];
+    __syncthreads();
+    float M = -INFINITY;
+    for (int g = 0; g < kv_split; ++g) M = fmaxf(M, s_meta[g].x);
+    float denom = 0.0f;
+    for (int g = 0; g < kv_split; ++g) denom += (s_meta[g].x == -INFINITY) ? 0.0f : s_meta[g].y * expf(s_meta[g].x - M);
+    const float Sinv = (denom == 0.0f) ? 0.0f : 1.0f / denom;
+    float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2) * dst_nb1);
     for (int d = threadIdx.x; d < DV; d += blockDim.x) {
-        float a = 0.0f;
-        for (int w = 0; w < n_split; ++w) a += (s_m[w] == -INFINITY) ? 0.0f : s_acc[(size_t) w * DV + d] * expf(s_m[w] - m_g);
-        out[d] = a * Sinv;
+        float num = 0.0f;
+        for (int g = 0; g < kv_split; ++g) num += (s_meta[g].x == -INFINITY) ? 0.0f : parts[(base + g) * DV + d] * expf(s_meta[g].x - M);
+        out[d] = num * Sinv;
     }
 }
 
@@ -431,6 +486,39 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // Decode / runtime / unspecialized: original 1-query-per-warp kernel (with split-K).
     const bool tiled = (n_split == 1 && n_q > 1 && head_dim == DV &&
                         (head_dim == 64 || head_dim == 128 || head_dim == 256));
+
+    // grid-level split-K for decode: the in-block split-K above fills at most one SM per (head,stream) block,
+    // but decode has only n_head*n_stream blocks (~n_head/nsm of the SMs), so its attention grows O(n_kv) on a
+    // fraction of the GPU. Fan each (head,stream)'s key range across kv_split *blocks* to use all SMs, then
+    // renormalise the per-block partials with the combine kernel. The partials live in a small TRANSIENT pool
+    // buffer freed at function exit -- the persistent int4 KV-cache VRAM saving (KPC's whole point) is untouched,
+    // same idiom as mainline f16 flash-attention's dst_tmp. Only when deep enough that the 2nd launch pays off.
+    int kv_split = 1;
+    if (!tiled && n_q == 1 && n_kv >= 2048 && head_dim == DV &&
+        (head_dim == 64 || head_dim == 128 || head_dim == 256)) {
+        const int  id  = ggml_cuda_get_device();
+        const int  nsm = ggml_cuda_info().devices[id].nsm;
+        const long base_blocks = (long) n_head * n_stream;
+        int want = (int) ((2L * nsm + base_blocks - 1) / base_blocks);   // ~2 resident blocks per SM
+        const int max_by_keys = n_kv / (32 * n_split);                   // keep >= 32 keys per warp-split per block
+        if (want > max_by_keys) want = max_by_keys;
+        static const int kv_cap = []{ const char * e = getenv("KPC_KVSPLIT_MAX"); return e ? atoi(e) : 0; }();
+        if (kv_cap > 0 && want > kv_cap) want = kv_cap;                  // A/B knob: =1 forces the no-grid-split oracle
+        if (want > 1) kv_split = want;
+    }
+
+    ggml_cuda_pool_alloc<float>  parts_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float2> meta_buf (ctx.pool());
+    float  * parts = nullptr;
+    float2 * meta  = nullptr;
+    if (kv_split > 1) {
+        const size_t nparts = (size_t) kv_split * n_head * n_stream;
+        parts = parts_buf.alloc(nparts * DV);
+        meta  = meta_buf.alloc(nparts);
+    }
+    const dim3 gridR = (kv_split > 1) ? dim3(n_head, kv_split, n_stream) : grid;
+    #define KPC_FA_DEC , parts, meta, kv_split
+
     if (tiled) {
         const int QT = 3;
         dim3 gridT(n_head, (n_q + QT - 1) / QT, n_stream);
@@ -438,10 +526,22 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         else if (head_dim == 128) kpc_flash_decode_qt_kernel<128,128, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
         else                      kpc_flash_decode_qt_kernel<256,256, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
     }
-    else if (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
-    else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
-    else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
-    else                                        kpc_flash_decode_kernel<  0,  0><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    else if (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
+    else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
+    else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
+    else                                        kpc_flash_decode_kernel<  0,  0><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
+
+    if (kv_split > 1) {                                              // renormalise the kv_split partials into dst
+        const int    cthreads = DV < 1024 ? DV : 1024;
+        const size_t csmem    = (size_t) kv_split * sizeof(float2);
+        dim3 gridC(n_head, n_stream);
+        #define KPC_COMBINE_ARGS parts, meta, (float *) dst->data, kv_split, n_head, DV, dst->nb[1], (int) dst->ne[1], (int) dst->ne[2]
+        if      (DV ==  64) kpc_flash_combine_kernel< 64><<<gridC, cthreads, csmem, ctx.stream()>>>(KPC_COMBINE_ARGS);
+        else if (DV == 128) kpc_flash_combine_kernel<128><<<gridC, cthreads, csmem, ctx.stream()>>>(KPC_COMBINE_ARGS);
+        else                kpc_flash_combine_kernel<256><<<gridC, cthreads, csmem, ctx.stream()>>>(KPC_COMBINE_ARGS);
+        #undef KPC_COMBINE_ARGS
+    }
+    #undef KPC_FA_DEC
     #undef KPC_FA_ARGS
 }
 
