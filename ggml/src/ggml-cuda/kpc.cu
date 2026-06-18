@@ -395,11 +395,20 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool v_q41 = V->type == GGML_TYPE_Q4_1;
 
     const int gi_stride = gi ? (int) (gi->nb[1] / sizeof(int32_t)) : 0;   // per-stream stride (= kv_size)
-    // split-K: when there are few query blocks (decode), split the key loop across warps so the GPU stays
-    // busy; prefill already has enough (head x query) blocks, so it stays at 1 warp (no reduction overhead).
+    // split-K: when there are few query blocks (decode), fan the key loop across warps within the block so the
+    // SM stays busy; the per-warp partials are combined in shared memory (no VRAM scratch). At decode the grid
+    // is only n_head(*n_stream) blocks, so without this the SMs sit at single-digit warp occupancy and can hide
+    // neither the K/V loads nor the per-key reduce -- which is why KPC decode was >2x slower than f16 despite
+    // moving ~4x less data. Grow n_split while it fits the hardware limits (1024 threads/block = 32*n_split, and
+    // the 48 KB default dynamic-smem budget) and does not oversubscribe the grid. The 1024-thread ceiling caps
+    // it at 32 warps; raising the old cap of 8 -> 32 ~doubled decode tg (e.g. 38->76 t/s @ ctx 4096). Prefill
+    // has many (head x query) blocks so the grid-budget test keeps it at n_split==1 (the tiled kernel, no reduce).
     const long blocks = (long) n_head * n_q * n_stream;
     int n_split = 1;
-    while (n_split < 8 && blocks * (n_split * 2) <= 2048 && (n_split * 2) <= n_kv) n_split *= 2;
+    while (32 * (n_split * 2) <= 1024 &&                                                    // threads/block limit
+           (size_t)((n_split * 2) * DV + 2 * (n_split * 2)) * sizeof(float) <= 48 * 1024 && // dynamic-smem budget
+           blocks * (n_split * 2) <= 2048 &&                                                // don't oversubscribe
+           (n_split * 2) <= n_kv) n_split *= 2;
     const int    nthreads = 32 * n_split;
     const size_t smem = (n_split > 1) ? ((size_t) n_split * DV + 2 * n_split) * sizeof(float) : 0;
     dim3 grid(n_head, n_q, n_stream);
