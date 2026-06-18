@@ -434,6 +434,8 @@ static __global__ void kpc_flash_decode_qt_kernel(
 // ============================================================================
 #define KPC_QM 16          // queries per block tile (MMA M dim)
 #define KPC_KN 16          // keys per inner tile
+#define KPC_NW 8           // warps per block: dequant runs on all NW warps (amortizes the ~24KB smem -> more
+                           // warps/SM to hide dequant latency); the QK/PV MMA + softmax stay on warp 0.
 
 template<int DK_T, int DV_T>
 static __global__ void kpc_flash_prefill_kernel(
@@ -453,7 +455,7 @@ static __global__ void kpc_flash_prefill_kernel(
     const int iq1base = blockIdx.y * KPC_QM;         // first query of this tile
     const int iq3     = blockIdx.z;                  // stream
     if (iq2 >= n_head || iq1base >= n_q || iq3 >= n_stream) return;
-    const int tid = threadIdx.x;                     // single warp: 0..31
+    const int tid = threadIdx.x;                     // 0..blockDim.x-1 (NW warps); warp 0 (tid<32) does the MMAs
 
     const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
     const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
@@ -482,15 +484,15 @@ static __global__ void kpc_flash_prefill_kernel(
     half  * Vf  = Kf  + KPC_KN * HD;                 // [DV][KN] d-major (so the PV MMA contracts over keys)
     half  * Pf  = Vf  + DV * KPC_KN;                 // [QM][KN] softmax probs in f16 (PV MMA operand)
 
-    // load Q -> Qf (f16), zero running state + accumulator
-    for (int idx = tid; idx < nqv * HD; idx += 32) {
+    // load Q -> Qf (f16), zero running state + accumulator (all warps cooperate)
+    for (int idx = tid; idx < nqv * HD; idx += blockDim.x) {
         const int q = idx / HD, c = idx % HD;
         const float * qr = (const float *)((const char *) Q + (size_t)(iq1base + q) * q_nb1 + (size_t) iq2 * q_nb2 + (size_t) iq3 * q_nb3);
         Qf[q * HD + c] = __float2half(qr[c]);
     }
-    for (int q = tid; q < KPC_QM; q += 32) { Mx[q] = -INFINITY; Ln[q] = 0.0f; }
-    for (int idx = tid; idx < KPC_QM * DV; idx += 32) Acc[idx] = 0.0f;
-    __syncwarp();
+    for (int q = tid; q < KPC_QM; q += blockDim.x) { Mx[q] = -INFINITY; Ln[q] = 0.0f; }
+    for (int idx = tid; idx < KPC_QM * DV; idx += blockDim.x) Acc[idx] = 0.0f;
+    __syncthreads();
 
     for (int kt = 0; kt < n_kv; kt += KPC_KN) {
         const int knv = (n_kv - kt) < KPC_KN ? (n_kv - kt) : KPC_KN;
@@ -504,18 +506,18 @@ static __global__ void kpc_flash_prefill_kernel(
                 const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
                 float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
                 const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
-                for (int c = tid; c < HD; c += 32) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
-                __syncwarp(); tile_pool = pool;
+                for (int c = tid; c < HD; c += blockDim.x) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
+                __syncthreads(); tile_pool = pool;
             }
             const uint8_t * krow = (const uint8_t *) Kp + (size_t) key * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
-            for (int c = tid; c < HD; c += 32) {
+            for (int c = tid; c < HD; c += blockDim.x) {
                 const uint8_t nb = krow[c >> 1];
                 const float nibble = (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F));
                 Kf[k * HD + c] = __float2half(nibble * scaZ[c] + zpcZ[c]);
             }
         }
         // ---- dequant V tile -> Vf, D-MAJOR [d][k] (q4_1 or f16); zero padded keys so P=0 * V can't make NaN ----
-        for (int idx = tid; idx < DV * KPC_KN; idx += 32) {
+        for (int idx = tid; idx < DV * KPC_KN; idx += blockDim.x) {
             const int d = idx / KPC_KN, k = idx % KPC_KN;
             float vv = 0.0f;
             if (k < knv) {
@@ -533,20 +535,16 @@ static __global__ void kpc_flash_prefill_kernel(
             }
             Vf[d * KPC_KN + k] = __float2half(vv);
         }
-        __syncwarp();
+        __syncthreads();
 
-        // ---- QK via f32-accumulate MMA: D[16q x 8k] = Q @ K^T (M2) ----
-        // Q/K are row-major f16 in smem; load_generic populates the operand fragments via the tile's own
-        // get_i/get_j (so it is correct by construction; M4 may switch to ldmatrix). 16-channel K-contraction
-        // steps, 2 key N-tiles of 8. Garbage in padded query/key rows lands in Sc slots that the softmax below
-        // ignores (k>=knv overwritten to 0) or never reads (q>=nqv), so no masking needed here.
-        {
+        // ---- QK MMA + per-query softmax: warp 0 only (MMA is warp-collective; lane q owns query q) ----
+        if (tid < 32) {
             using namespace ggml_cuda_mma;
             const half2 * Qh2 = (const half2 *) Qf;     // [QM][HD/2] row-major
             const half2 * Kh2 = (const half2 *) Kf;     // [KN][HD/2] row-major
             const int hd2 = HD / 2;
             #pragma unroll
-            for (int n = 0; n < KPC_KN / 8; ++n) {
+            for (int n = 0; n < KPC_KN / 8; ++n) {      // D[16q x 8k] = Q @ K^T over 16-channel steps, 2 N-tiles
                 tile<16, 8, float> D;
                 #pragma unroll
                 for (int s = 0; s < HD / 16; ++s) {
@@ -561,45 +559,42 @@ static __global__ void kpc_flash_prefill_kernel(
                     Sc[D.get_i(l) * KPC_KN + 8 * n + D.get_j(l)] = D.x[l];
                 }
             }
-        }
-        __syncwarp();
-
-        // ---- per-query online-softmax update (lane q owns query q) ----
-        if (tid < nqv) {
-            const int q = tid;
-            const int qpos = iq1base + q;
-            const half * mp = mask ? (const half *)((const char *) mask + (size_t) qpos * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
-            float tilemax = -INFINITY;
-            float proc[KPC_KN];
-            for (int k = 0; k < knv; ++k) {
-                const int key = kt + k;
-                float sc = Sc[q * KPC_KN + k] * kqscale;
-                if (logit_softcap != 0.0f) sc = logit_softcap * tanhf(sc / logit_softcap);
-                const float mv = mp ? __half2float(mp[key]) : 0.0f;
-                sc += slope * mv;
-                proc[k] = sc;
-                tilemax = fmaxf(tilemax, sc);
+            __syncwarp();                               // warp-0 internal: all lanes' Sc writes visible
+            if (tid < nqv) {
+                const int q = tid;
+                const int qpos = iq1base + q;
+                const half * mp = mask ? (const half *)((const char *) mask + (size_t) qpos * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
+                float tilemax = -INFINITY;
+                float proc[KPC_KN];
+                for (int k = 0; k < knv; ++k) {
+                    const int key = kt + k;
+                    float sc = Sc[q * KPC_KN + k] * kqscale;
+                    if (logit_softcap != 0.0f) sc = logit_softcap * tanhf(sc / logit_softcap);
+                    const float mv = mp ? __half2float(mp[key]) : 0.0f;
+                    sc += slope * mv;
+                    proc[k] = sc;
+                    tilemax = fmaxf(tilemax, sc);
+                }
+                const float mn = fmaxf(Mx[q], tilemax);
+                const float a  = expf(Mx[q] - mn);
+                float sump = 0.0f;
+                for (int k = 0; k < knv; ++k) { const float p = expf(proc[k] - mn); Sc[q * KPC_KN + k] = p; sump += p; }
+                for (int k = knv; k < KPC_KN; ++k) Sc[q * KPC_KN + k] = 0.0f;
+                Ln[q] = Ln[q] * a + sump;
+                Mx[q] = mn;
+                Av[q] = a;
             }
-            const float mn = fmaxf(Mx[q], tilemax);
-            const float a  = expf(Mx[q] - mn);
-            float sump = 0.0f;
-            for (int k = 0; k < knv; ++k) { const float p = expf(proc[k] - mn); Sc[q * KPC_KN + k] = p; sump += p; }
-            for (int k = knv; k < KPC_KN; ++k) Sc[q * KPC_KN + k] = 0.0f;
-            Ln[q] = Ln[q] * a + sump;
-            Mx[q] = mn;
-            Av[q] = a;
         }
-        __syncwarp();
+        __syncthreads();                                // Av, Sc(probs), Mx, Ln from warp 0 -> all warps
 
-        // ---- PV via MMA: rescale Acc by this tile's softmax factor, then Acc[16q x DV] += P @ V (M3) ----
-        for (int idx = tid; idx < nqv * DV; idx += 32) Acc[idx] *= Av[idx / DV];   // online rescale (q<nqv)
-        __syncwarp();
-        for (int idx = tid; idx < KPC_QM * KPC_KN; idx += 32) {                    // P (probs) -> f16 operand
+        // ---- PV: rescale Acc by this tile's softmax factor (all warps), convert P -> f16, then warp-0 P@V MMA ----
+        for (int idx = tid; idx < nqv * DV; idx += blockDim.x) Acc[idx] *= Av[idx / DV];
+        for (int idx = tid; idx < KPC_QM * KPC_KN; idx += blockDim.x) {
             const int q = idx / KPC_KN;
             Pf[idx] = (q < nqv) ? __float2half(Sc[idx]) : __float2half(0.0f);
         }
-        __syncwarp();
-        {
+        __syncthreads();
+        if (tid < 32) {
             using namespace ggml_cuda_mma;
             const int kn2 = KPC_KN / 2;                                            // half2 cols (= keys/2)
             tile<16, 8, half2> A;                                                  // P: 16 queries x KN keys
@@ -616,7 +611,7 @@ static __global__ void kpc_flash_prefill_kernel(
                 }
             }
         }
-        __syncwarp();
+        __syncthreads();                                // Acc from PV done; safe to overwrite Kf/Vf next tile
     }
 
     // ---- attention sink (fold once per query) + write normalized output ----
@@ -632,8 +627,8 @@ static __global__ void kpc_flash_prefill_kernel(
             Av[q] = 1.0f;
         }
     }
-    __syncwarp();
-    for (int idx = tid; idx < nqv * DV; idx += 32) {
+    __syncthreads();
+    for (int idx = tid; idx < nqv * DV; idx += blockDim.x) {
         const int q = idx / DV, d = idx % DV;
         const float Sinv = (Ln[q] == 0.0f) ? 0.0f : 1.0f / Ln[q];
         const int iq1 = iq1base + q;
@@ -743,9 +738,10 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         dim3 gridM(n_head, (n_q + KPC_QM - 1) / KPC_QM, n_stream);
         const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + DV * KPC_KN + KPC_QM * KPC_KN) * sizeof(half)
                             + (size_t)(KPC_QM * DV + KPC_QM * KPC_KN + 2 * head_dim + 3 * KPC_QM) * sizeof(float);
-        if      (head_dim ==  64) kpc_flash_prefill_kernel< 64, 64><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
-        else if (head_dim == 128) kpc_flash_prefill_kernel<128,128><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
-        else                      kpc_flash_prefill_kernel<256,256><<<gridM, 32, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+        const int nthr_m = 32 * KPC_NW;
+        if      (head_dim ==  64) kpc_flash_prefill_kernel< 64, 64><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+        else if (head_dim == 128) kpc_flash_prefill_kernel<128,128><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+        else                      kpc_flash_prefill_kernel<256,256><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
     }
     else if (tiled) {
         const int QT = 3;
