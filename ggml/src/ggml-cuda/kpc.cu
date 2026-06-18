@@ -732,9 +732,24 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 gridR = (kv_split > 1) ? dim3(n_head, kv_split, n_stream) : grid;
     #define KPC_FA_DEC , parts, meta, kv_split
 
-    // tensor-core prefill path (dev-gated behind KPC_MMA while milestones M1..M4 land; default keeps query-tiled).
-    static const int kpc_mma = []{ const char * e = getenv("KPC_MMA"); return e ? atoi(e) : 0; }();
-    if (tiled && kpc_mma) {
+    // tensor-core prefill path. cc>=Turing is a hard CORRECTNESS floor: the MMA intrinsics compile to NO_DEVICE_CODE
+    // (trap) on older arches (Pascal etc.), so MMA must never *launch* there -- those devices fall back to the
+    // query-tiled scalar kernel. On capable hardware MMA wins once there are enough keys to amortise the f16 staging
+    // (n_kv>=2048; below that the query-tiled kernel is faster AND lossless -- see the crossover in the perf handoff).
+    // KPC_MMA tri-state override: unset = auto(n_kv>=2048); 1 = force MMA at any n_kv; 0 = force query-tiled.
+    static const int kpc_mma = []{ const char * e = getenv("KPC_MMA"); return e ? atoi(e) : -1; }();
+    bool use_mma = false;
+    if (tiled) {
+        const int  dev_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool cc_mma = dev_cc >= GGML_CUDA_CC_TURING;
+        use_mma = cc_mma && ((kpc_mma == 1) || (kpc_mma == -1 && n_kv >= 2048));
+        if (kpc_mma == 1 && !cc_mma) {                              // forced on hardware that can't run MMA
+            static int warned = 0;
+            if (!warned) { warned = 1;
+                fprintf(stderr, "KPC: KPC_MMA=1 but device cc %d < Turing (750) -- using query-tiled kernel\n", dev_cc); }
+        }
+    }
+    if (use_mma) {
         dim3 gridM(n_head, (n_q + KPC_QM - 1) / KPC_QM, n_stream);
         const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + DV * KPC_KN + KPC_QM * KPC_KN) * sizeof(half)
                             + (size_t)(KPC_QM * DV + KPC_QM * KPC_KN + 2 * head_dim + 3 * KPC_QM) * sizeof(float);
