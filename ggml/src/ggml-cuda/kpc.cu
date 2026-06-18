@@ -1,4 +1,5 @@
 #include "kpc.cuh"
+#include "mma.cuh"
 
 // ============================================================================
 // KPC CUDA — GPU-native per-channel int4 K-cache (branch kpc-cuda-kv).
@@ -530,13 +531,32 @@ static __global__ void kpc_flash_prefill_kernel(
         }
         __syncwarp();
 
-        // ---- QK: Sc[q][k] = f32 dot(Qf[q], Kf[k]) (SCALAR; M2 replaces with MMA) ----
-        for (int idx = tid; idx < KPC_QM * KPC_KN; idx += 32) {
-            const int q = idx / KPC_KN, k = idx % KPC_KN;
-            if (q >= nqv || k >= knv) { Sc[idx] = 0.0f; continue; }
-            float acc = 0.0f;
-            for (int c = 0; c < HD; ++c) acc += __half2float(Qf[q * HD + c]) * __half2float(Kf[k * HD + c]);
-            Sc[idx] = acc;
+        // ---- QK via f32-accumulate MMA: D[16q x 8k] = Q @ K^T (M2) ----
+        // Q/K are row-major f16 in smem; load_generic populates the operand fragments via the tile's own
+        // get_i/get_j (so it is correct by construction; M4 may switch to ldmatrix). 16-channel K-contraction
+        // steps, 2 key N-tiles of 8. Garbage in padded query/key rows lands in Sc slots that the softmax below
+        // ignores (k>=knv overwritten to 0) or never reads (q>=nqv), so no masking needed here.
+        {
+            using namespace ggml_cuda_mma;
+            const half2 * Qh2 = (const half2 *) Qf;     // [QM][HD/2] row-major
+            const half2 * Kh2 = (const half2 *) Kf;     // [KN][HD/2] row-major
+            const int hd2 = HD / 2;
+            #pragma unroll
+            for (int n = 0; n < KPC_KN / 8; ++n) {
+                tile<16, 8, float> D;
+                #pragma unroll
+                for (int s = 0; s < HD / 16; ++s) {
+                    tile<16, 8, half2> A;
+                    tile<8,  8, half2> B;
+                    load_generic(A, Qh2 + 8 * s,                  hd2);
+                    load_generic(B, Kh2 + (8 * n) * hd2 + 8 * s,  hd2);
+                    mma(D, A, B);
+                }
+                #pragma unroll
+                for (int l = 0; l < D.ne; ++l) {
+                    Sc[D.get_i(l) * KPC_KN + 8 * n + D.get_j(l)] = D.x[l];
+                }
+            }
         }
         __syncwarp();
 
