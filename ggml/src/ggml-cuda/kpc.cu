@@ -696,12 +696,14 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (fe == cudaSuccess && fa.maxThreadsPerBlock > 0)
             while (n_split > 1 && 32 * n_split > fa.maxThreadsPerBlock) n_split /= 2;
     }
-    // Determinism gate: split-K's per-warp partition + combine is not bit-reproducible across SEPARATE context
-    // instances, so when the cache holds >1 sequence (state restore / continuous batching) a restored or sibling
-    // sequence could see another sequence's decode drift by ~0.2 logits. Fall back to single-warp (deterministic)
-    // decode there. Single-stream inference (n_seq_max==1) keeps the split-K occupancy path. Env override for A/B.
-    const int n_seq_max = (int) params[3];
-    if ((n_seq_max > 1 && !getenv("KPC_FORCE_SPLITK")) || getenv("KPC_NSPLIT1")) n_split = 1;
+    // Determinism gate: split-K's per-warp partition + combine (BOTH the in-block n_split here and the grid-level
+    // kv_split below) is not bit-reproducible across SEPARATE context instances, so when the cache holds >1 sequence
+    // (state restore / continuous batching) a restored or sibling sequence could see another sequence's decode drift
+    // by ~0.2 logits. Force single-warp + single-block (deterministic) decode there. Single-stream inference
+    // (n_seq_max==1) keeps both split-K paths. Env override for A/B.
+    const int  n_seq_max     = (int) params[3];
+    const bool kpc_det_decode = (n_seq_max > 1 && !getenv("KPC_FORCE_SPLITK")) || getenv("KPC_NSPLIT1");
+    if (kpc_det_decode) n_split = 1;
     const int    nthreads = 32 * n_split;
     const size_t smem = (n_split > 1) ? ((size_t) n_split * DV + 2 * n_split) * sizeof(float) : 0;
     dim3 grid(n_head, n_q, n_stream);
@@ -732,7 +734,10 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // buffer freed at function exit -- the persistent int4 KV-cache VRAM saving (KPC's whole point) is untouched,
     // same idiom as mainline f16 flash-attention's dst_tmp. Only when deep enough that the 2nd launch pays off.
     int kv_split = 1;
-    if (!tiled && n_q == 1 && n_kv >= 2048 && head_dim == DV &&
+    // ...and the grid-level split too: with the in-block split forced to n_split=1 above, leaving the grid-split on
+    // (kv_split>1) still drifts the restored sequence ~0.08 across context instances in the unified banded cache at
+    // depth (n_kv>=2048). Both split-K paths must be off together under multi-seq for a deterministic decode.
+    if (!tiled && n_q == 1 && n_kv >= 2048 && !kpc_det_decode && head_dim == DV &&
         (head_dim == 64 || head_dim == 128 || head_dim == 256)) {
         const int  id  = ggml_cuda_get_device();
         const int  nsm = ggml_cuda_info().devices[id].nsm;
