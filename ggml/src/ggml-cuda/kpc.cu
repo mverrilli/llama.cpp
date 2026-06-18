@@ -442,6 +442,15 @@ static __global__ void kpc_flash_decode_qt_kernel(
 #define KPC_NW 8           // warps per block: dequant runs on all NW warps (amortizes the ~24KB smem -> more
                            // warps/SM to hide dequant latency); the QK/PV MMA + softmax stay on warp 0.
 
+#ifdef KPC_CLOCKPROF
+// dev-only phase profiler (M0b): cumulative cycle counts per phase across all prefill MMA launches.
+// [0]=prologue [1]=dequantK [2]=QK-MMA [3]=rescale+Pconvert [4]=PV [5]=epilogue [6]=dequantV [7]=softmax
+__device__ unsigned long long g_kpc_prof[8];
+#define KPC_PROF(slot) do { if (tid == 0) { long long _n = clock64(); _acc[slot] += (unsigned long long)(_n - _tk); _tk = _n; } } while (0)
+#else
+#define KPC_PROF(slot)
+#endif
+
 template<int DK_T, int DV_T>
 static __global__ void kpc_flash_prefill_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
@@ -466,6 +475,11 @@ static __global__ void kpc_flash_prefill_kernel(
     const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
     const int cbase = ik2 * HD;
     const int nqv = (n_q - iq1base) < KPC_QM ? (n_q - iq1base) : KPC_QM;   // valid queries (tail)
+
+#ifdef KPC_CLOCKPROF
+    unsigned long long _acc[8] = {0,0,0,0,0,0,0,0};
+    long long _tk = clock64();
+#endif
 
     float slope = 1.0f;
     if (max_bias > 0.0f) {
@@ -498,29 +512,59 @@ static __global__ void kpc_flash_prefill_kernel(
     for (int q = tid; q < KPC_QM; q += blockDim.x) { Mx[q] = -INFINITY; Ln[q] = 0.0f; }
     for (int idx = tid; idx < KPC_QM * DV; idx += blockDim.x) Acc[idx] = 0.0f;
     __syncthreads();
+    KPC_PROF(0);
 
     for (int kt = 0; kt < n_kv; kt += KPC_KN) {
         const int knv = (n_kv - kt) < KPC_KN ? (n_kv - kt) : KPC_KN;
         // ---- dequant K tile -> Kf (per-channel: nibble*scale + zp; group scale/zp cached in smem) ----
-        int tile_pool = -1;
-        for (int k = 0; k < knv; ++k) {
-            const int key = kt + k;
-            int pool = gid ? gid[(size_t) ik3 * gi_stride + key] : (key / GGML_KPC_GROUP);
-            if (pool < 0) pool = 0;
-            if (pool != tile_pool) {
-                const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
-                float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
-                const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
-                for (int c = tid; c < HD; c += blockDim.x) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
-                __syncthreads(); tile_pool = pool;
+        // Positional tiles (gid==null) are always single-pool (GROUP=32, KN=16, 16-aligned kt); gid tiles are too
+        // when the cell->pool map is positional. Single-pool => dequant K over a FLAT (key,channel) grid-stride loop:
+        // all NW warps stay busy (the per-key loop left threads >= HD idle at HD=128) and all knv key-rows' global
+        // loads are issued concurrently instead of one latency-bound key at a time. Output is bit-identical.
+        int pool0 = gid ? gid[(size_t) ik3 * gi_stride + kt] : (kt / GGML_KPC_GROUP);
+        if (pool0 < 0) pool0 = 0;
+        bool single_pool = true;
+        if (gid) {
+            for (int k = 1; k < knv; ++k) {
+                int p = gid[(size_t) ik3 * gi_stride + kt + k]; if (p < 0) p = 0;
+                if (p != pool0) { single_pool = false; break; }
             }
-            const uint8_t * krow = (const uint8_t *) Kp + (size_t) key * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
-            for (int c = tid; c < HD; c += blockDim.x) {
+        }
+        if (single_pool) {
+            const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool0 * sz_nb1;
+            float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
+            const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+            for (int c = tid; c < HD; c += blockDim.x) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
+            __syncthreads();
+            for (int idx = tid; idx < knv * HD; idx += blockDim.x) {
+                const int k = idx / HD, c = idx % HD;
+                const uint8_t * krow = (const uint8_t *) Kp + (size_t)(kt + k) * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
                 const uint8_t nb = krow[c >> 1];
                 const float nibble = (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F));
                 Kf[k * HD + c] = __float2half(nibble * scaZ[c] + zpcZ[c]);
             }
+        } else {
+            int tile_pool = -1;                         // rare gid multi-pool tile: per-key serial fallback
+            for (int k = 0; k < knv; ++k) {
+                const int key = kt + k;
+                int pool = gid[(size_t) ik3 * gi_stride + key];
+                if (pool < 0) pool = 0;
+                if (pool != tile_pool) {
+                    const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
+                    float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
+                    const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+                    for (int c = tid; c < HD; c += blockDim.x) { scaZ[c] = qs[cbase + c] * ss; zpcZ[c] = zmn + qz[cbase + c] * szc; }
+                    __syncthreads(); tile_pool = pool;
+                }
+                const uint8_t * krow = (const uint8_t *) Kp + (size_t) key * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
+                for (int c = tid; c < HD; c += blockDim.x) {
+                    const uint8_t nb = krow[c >> 1];
+                    const float nibble = (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F));
+                    Kf[k * HD + c] = __float2half(nibble * scaZ[c] + zpcZ[c]);
+                }
+            }
         }
+        KPC_PROF(1);                                    // K dequant (no barrier; tid==0 local estimate)
         // ---- dequant V tile -> Vf, D-MAJOR [d][k] (q4_1 or f16); zero padded keys so P=0 * V can't make NaN ----
         for (int idx = tid; idx < DV * KPC_KN; idx += blockDim.x) {
             const int d = idx / KPC_KN, k = idx % KPC_KN;
@@ -541,6 +585,7 @@ static __global__ void kpc_flash_prefill_kernel(
             Vf[d * KPC_KN + k] = __float2half(vv);
         }
         __syncthreads();
+        KPC_PROF(6);                                    // V dequant
 
         // ---- QK MMA + per-query softmax: warp 0 only (MMA is warp-collective; lane q owns query q) ----
         if (tid < 32) {
@@ -565,6 +610,7 @@ static __global__ void kpc_flash_prefill_kernel(
                 }
             }
             __syncwarp();                               // warp-0 internal: all lanes' Sc writes visible
+            KPC_PROF(2);                                // QK MMA (warp-0 collective)
             if (tid < nqv) {
                 const int q = tid;
                 const int qpos = iq1base + q;
@@ -591,6 +637,7 @@ static __global__ void kpc_flash_prefill_kernel(
             }
         }
         __syncthreads();                                // Av, Sc(probs), Mx, Ln from warp 0 -> all warps
+        KPC_PROF(7);                                    // softmax
 
         // ---- PV: rescale Acc by this tile's softmax factor (all warps), convert P -> f16, then warp-0 P@V MMA ----
         for (int idx = tid; idx < nqv * DV; idx += blockDim.x) Acc[idx] *= Av[idx / DV];
@@ -599,6 +646,7 @@ static __global__ void kpc_flash_prefill_kernel(
             Pf[idx] = (q < nqv) ? __float2half(Sc[idx]) : __float2half(0.0f);
         }
         __syncthreads();
+        KPC_PROF(3);
         if (tid < 32) {
             using namespace ggml_cuda_mma;
             const int kn2 = KPC_KN / 2;                                            // half2 cols (= keys/2)
@@ -617,6 +665,7 @@ static __global__ void kpc_flash_prefill_kernel(
             }
         }
         __syncthreads();                                // Acc from PV done; safe to overwrite Kf/Vf next tile
+        KPC_PROF(4);
     }
 
     // ---- attention sink (fold once per query) + write normalized output ----
@@ -640,6 +689,13 @@ static __global__ void kpc_flash_prefill_kernel(
         float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
         out[d] = Acc[q * DV + d] * Av[q] * Sinv;
     }
+#ifdef KPC_CLOCKPROF
+    KPC_PROF(5);
+    if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) atomicAdd(&g_kpc_prof[i], _acc[i]);
+    }
+#endif
 }
 
 // ---- host wrappers (thin launchers; exercised once M3 wires the GPU-native tensors) ----
@@ -787,6 +843,18 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if      (head_dim ==  64) kpc_flash_prefill_kernel< 64, 64><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
         else if (head_dim == 128) kpc_flash_prefill_kernel<128,128><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
         else                      kpc_flash_prefill_kernel<256,256><<<gridM, nthr_m, smem_m, ctx.stream()>>>(KPC_FA_ARGS);
+#ifdef KPC_CLOCKPROF
+        {   static int pc = 0;
+            if ((++pc % 64) == 0) {                       // periodic cumulative-ratio dump (dev build only)
+                cudaStreamSynchronize(ctx.stream());
+                unsigned long long h[8] = {0,0,0,0,0,0,0,0};
+                cudaMemcpyFromSymbol(h, g_kpc_prof, sizeof(h));
+                unsigned long long tot = h[0]+h[1]+h[2]+h[3]+h[4]+h[5]+h[6]+h[7];
+                if (tot) fprintf(stderr, "[KPC-PROF] prologue=%.1f dequantK=%.1f dequantV=%.1f QKmma=%.1f softmax=%.1f rescale=%.1f pv=%.1f epilogue=%.1f  (tot=%llu)\n",
+                    100.0*h[0]/tot, 100.0*h[1]/tot, 100.0*h[6]/tot, 100.0*h[2]/tot, 100.0*h[7]/tot, 100.0*h[3]/tot, 100.0*h[4]/tot, 100.0*h[5]/tot, tot);
+            }
+        }
+#endif
     }
     else if (tiled) {
         const int QT = 3;
