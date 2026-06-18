@@ -1919,6 +1919,16 @@ void llama_kv_cache::kpc_rebuild_group_index() const {
     const uint32_t ng_max    = (uint32_t) layers[0].k_scalezp->ne[1];
     const uint32_t band_size = ng_max / n_seqps;
 
+    // A committed cell's int4 rows are packed under the scale of its CURRENT pool. This positional recompute can
+    // move it to a DIFFERENT pool when its owner changes -- e.g. after a fork: seq_cp shares a cell, then the source
+    // seq is removed/reused, so the cell's owner (and thus its band) changes. The device seal never re-packs it, so
+    // the NEW pool's scale must be made to match: migrate (copy) the old pool's scale slab to the new pool before
+    // switching gid. The rebuild runs before the seal, so the old pool still holds the right scale at copy time.
+    // Without this the GPU read dequants the cell against an unrelated scale (catastrophic). The CPU write's
+    // in-kernel rescue handles this on the host path (it relocates + copies scale itself); this is the device analog.
+    std::vector<std::array<int32_t, 3>> migs;   // distinct (stream, old_pool, new_pool) relocations
+    const int32_t * gid0 = (const int32_t *) layers[0].group_index->data;   // all layers carry the same cell->pool map
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
@@ -1937,8 +1947,36 @@ void llama_kv_cache::kpc_rebuild_group_index() const {
                 const uint32_t band = ((uint32_t) sq % n_seqps) * band_size;
                 pool = (int32_t) (band + lg % band_size);
             }
+            const int32_t old_pool = gid0[(size_t) s*kvs + i];   // read BEFORE the switch below
+            if (pool >= 0 && old_pool >= 0 && pool != old_pool) {
+                bool seen = false;
+                for (const auto & m : migs) { if (m[0] == (int32_t) s && m[1] == old_pool && m[2] == pool) { seen = true; break; } }
+                if (!seen) { migs.push_back({ (int32_t) s, old_pool, pool }); }
+            }
             for (const auto & layer : layers) {
                 ((int32_t *) layer.group_index->data)[(size_t) s*kvs + i] = pool;
+            }
+        }
+    }
+
+    // migrate the scale slabs of relocated cells. Read ALL sources first, then write, so a chained
+    // old->new->newer relocation can't clobber a source before it's read. No-op (no device traffic) when nothing moved.
+    if (!migs.empty()) {
+        const size_t slab = layers[0].k_scalezp->nb[1];
+        std::vector<std::vector<uint8_t>> src(migs.size());
+        for (size_t m = 0; m < migs.size(); ++m) {
+            src[m].resize(slab * layers.size());
+            for (size_t l = 0; l < layers.size(); ++l) {
+                ggml_tensor * sz = layers[l].k_scalezp;
+                const size_t off = (size_t) migs[m][0]*sz->nb[2] + (size_t) migs[m][1]*sz->nb[1];
+                ggml_backend_tensor_get(sz, src[m].data() + l*slab, off, slab);
+            }
+        }
+        for (size_t m = 0; m < migs.size(); ++m) {
+            for (size_t l = 0; l < layers.size(); ++l) {
+                ggml_tensor * sz = layers[l].k_scalezp;
+                const size_t off = (size_t) migs[m][0]*sz->nb[2] + (size_t) migs[m][2]*sz->nb[1];
+                ggml_backend_tensor_set(sz, src[m].data() + l*slab, off, slab);
             }
         }
     }
