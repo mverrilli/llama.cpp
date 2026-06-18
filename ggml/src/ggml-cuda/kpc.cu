@@ -228,6 +228,147 @@ static __global__ void kpc_flash_decode_kernel(
     }
 }
 
+// ---- query-tiled flash-decode read: 1 warp per (head, QUERY-TILE of QT, stream). For prefill the original
+// 1-warp-per-query kernel reloads the WHOLE K/V cache once PER QUERY (n_kv x n_q redundant loads) -- the
+// dominant cost at long context. Here each key's K nibbles + V row are loaded ONCE into registers and reused
+// for all QT queries in the tile, so K/V load traffic drops ~QT x. Single warp only (no split-K) -> used for
+// prefill (n_split==1, n_q>1); decode (n_split>1) keeps the original kernel. Same math/parity per query. ----
+template<int DK_T, int DV_T, int QT>
+static __global__ void kpc_flash_decode_qt_kernel(
+        const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
+        const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
+        int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
+        int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
+        int64_t sz_nb1, int64_t sz_nb2,
+        int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+        int64_t m_nb1, int64_t m_nb2, int64_t m_nb3, int m_ne2, int m_ne3,
+        int64_t dst_nb1, int dst_ne1, int dst_ne2, int n_split) {
+    const int iq2     = blockIdx.x;                  // query head
+    const int iq1base = blockIdx.y * QT;             // first query of this tile
+    const int iq3     = blockIdx.z;                  // stream
+    if (iq2 >= n_head || iq1base >= n_q || iq3 >= n_stream) return;
+    const int lane = threadIdx.x & 31;
+
+    const int head_dim = DK_T ? DK_T : head_dim_rt;
+    const int DV       = DV_T ? DV_T : DV_rt;
+    constexpr int NQP  = DK_T ? ((DK_T + 31) / 32) : 8;
+    constexpr int NACC = DV_T ? ((DV_T + 31) / 32) : 16;
+    const int ndv = NACC;
+
+    const int ik2 = iq2 / rk2, iv2 = iq2 / rv2;
+    const int ik3 = iq3 / rk3, iv3 = iq3 / rv3;
+    const int cbase = ik2 * head_dim;
+
+    float slope = 1.0f;
+    if (max_bias > 0.0f) {
+        const int n_head_log2 = 1 << (int) floorf(log2f((float) n_head));
+        const float m0 = exp2f(-(max_bias)        / n_head_log2);
+        const float m1 = exp2f(-(max_bias / 2.0f) / n_head_log2);
+        slope = (iq2 < n_head_log2) ? powf(m0, iq2 + 1) : powf(m1, 2 * (iq2 - n_head_log2) + 1);
+    }
+
+    const int nq_tile = (n_q - iq1base) < QT ? (n_q - iq1base) : QT;   // valid queries in this tile (tail)
+    const float * qrow[QT];
+    const half  * mp[QT];
+    float qp[QT][NQP];
+    float corr[QT];
+    float acc[QT][NACC];
+    float m[QT], l[QT];
+    #pragma unroll
+    for (int r = 0; r < QT; ++r) {
+        const int iq1 = iq1base + r;
+        const int rr  = r < nq_tile ? iq1 : iq1base;   // clamp tail lanes to a valid row (results discarded)
+        qrow[r] = (const float *)((const char *) Q + (size_t) rr * q_nb1 + (size_t) iq2 * q_nb2 + (size_t) iq3 * q_nb3);
+        mp[r]   = mask ? (const half *)((const char *) mask + (size_t) rr * m_nb1 + (size_t)(iq2 % m_ne2) * m_nb2 + (size_t)(iq3 % m_ne3) * m_nb3) : nullptr;
+        for (int j = 0; j < ndv; ++j) acc[r][j] = 0.0f;
+        m[r] = -INFINITY; l[r] = 0.0f; corr[r] = 0.0f;
+    }
+    int cur_pool = -1;
+
+    for (int t = 0; t < n_kv; ++t) {
+        // skip a key only if EVERY query in the tile masks it (causal: t beyond the tile's last query)
+        bool any = false;
+        float mv[QT];
+        #pragma unroll
+        for (int r = 0; r < QT; ++r) { mv[r] = mp[r] ? __half2float(mp[r][t]) : 0.0f; if (r < nq_tile && mv[r] != -INFINITY) any = true; }
+        if (!any) continue;
+
+        int pool = gid ? gid[(size_t) ik3 * gi_stride + t] : (t / GGML_KPC_GROUP);
+        if (pool < 0) pool = 0;
+        if (pool != cur_pool) {                          // refold every query's Q against this group's scale/zp
+            const uint8_t * s = sz0 + (size_t) ik3 * sz_nb2 + (size_t) pool * sz_nb1;
+            float ss, zmn, szc; kpc_slab_super(s, &ss, &zmn, &szc);
+            const uint8_t * qs = s + 6; const uint8_t * qz = s + 6 + C_full;
+            float lc[QT];
+            #pragma unroll
+            for (int r = 0; r < QT; ++r) lc[r] = 0.0f;
+            int ci = 0;
+            for (int c = lane; c < head_dim; c += 32, ++ci) {
+                const int fc = cbase + c;
+                const float sca = qs[fc] * ss, zpc = zmn + qz[fc] * szc;
+                #pragma unroll
+                for (int r = 0; r < QT; ++r) { qp[r][ci] = qrow[r][c] * sca; lc[r] += qrow[r][c] * zpc; }
+            }
+            #pragma unroll
+            for (int r = 0; r < QT; ++r) { for (int o = 16; o > 0; o >>= 1) lc[r] += __shfl_xor_sync(0xffffffff, lc[r], o); corr[r] = lc[r]; }
+            cur_pool = pool;
+        }
+        // load this key's K nibbles for the lane's channels ONCE, reuse across the tile
+        const uint8_t * krow = (const uint8_t *) Kp + (size_t) t * k_nb1 + (size_t) ik2 * k_nb2 + (size_t) ik3 * k_nb3;
+        float nbv[NQP]; { int ci = 0; for (int c = lane; c < head_dim; c += 32, ++ci) { const uint8_t nb = krow[c >> 1]; nbv[ci] = (float) ((c & 1) ? (nb >> 4) : (nb & 0x0F)); } }
+        // load this key's V row for the lane's elements ONCE
+        const uint8_t * vrow = (const uint8_t *) V + (size_t) t * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
+        float vv[NACC];
+        for (int j = 0; j < ndv; ++j) {
+            const int d = lane + j * 32;
+            if (d >= DV) { vv[j] = 0.0f; continue; }
+            if (v_q41) {
+                const uint8_t * blk = vrow + (d / 32) * 20;
+                const float vd = __half2float(*(const half *)(blk + 0));
+                const float vm = __half2float(*(const half *)(blk + 2));
+                const int dj = d % 32;
+                const uint8_t b = blk[4 + (dj % 16)];
+                vv[j] = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
+            } else {
+                vv[j] = __half2float(((const half *) vrow)[d]);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < QT; ++r) {
+            if (r >= nq_tile || mv[r] == -INFINITY) continue;       // this query does not attend key t
+            float part = 0.0f;
+            int ci = 0;
+            for (int c = lane; c < head_dim; c += 32, ++ci) part += qp[r][ci] * nbv[ci];
+            for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffff, part, o);
+            float score = (part + corr[r]) * kqscale;
+            if (logit_softcap != 0.0f) score = logit_softcap * tanhf(score / logit_softcap);
+            score += slope * mv[r];
+            const float mn = fmaxf(m[r], score), a = expf(m[r] - mn), p = expf(score - mn);
+            l[r] = l[r] * a + p;
+            for (int j = 0; j < ndv; ++j) acc[r][j] = acc[r][j] * a + p * vv[j];
+            m[r] = mn;
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < QT; ++r) {
+        if (r >= nq_tile) continue;
+        if (sinks) {
+            const float sk = sinks[iq2];
+            const float mn = fmaxf(m[r], sk), a = expf(m[r] - mn), p = expf(sk - mn);
+            l[r] = l[r] * a + p;
+            for (int j = 0; j < ndv; ++j) acc[r][j] *= a;
+            m[r] = mn;
+        }
+        const int iq1 = iq1base + r;
+        float * out = (float *)((char *) dst + (size_t)((size_t) iq3 * dst_ne2 * dst_ne1 + iq2 + (size_t) iq1 * dst_ne1) * dst_nb1);
+        const float Sinv = (l[r] == 0.0f) ? 0.0f : 1.0f / l[r];
+        for (int j = 0; j < ndv; ++j) { const int d = lane + j * 32; if (d < DV) out[d] = acc[r][j] * Sinv; }
+    }
+}
+
 // ---- host wrappers (thin launchers; exercised once M3 wires the GPU-native tensors) ----
 
 void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -277,7 +418,18 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0, \
         mask ? (int) mask->ne[2] : 1, mask ? (int) mask->ne[3] : 1, \
         dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], n_split
-    if      (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
+    // Prefill (n_split==1, many queries): query-tiled kernel reuses each key's K/V load across QT queries.
+    // Decode / runtime / unspecialized: original 1-query-per-warp kernel (with split-K).
+    const bool tiled = (n_split == 1 && n_q > 1 && head_dim == DV &&
+                        (head_dim == 64 || head_dim == 128 || head_dim == 256));
+    if (tiled) {
+        const int QT = 3;
+        dim3 gridT(n_head, (n_q + QT - 1) / QT, n_stream);
+        if      (head_dim ==  64) kpc_flash_decode_qt_kernel< 64, 64, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
+        else if (head_dim == 128) kpc_flash_decode_qt_kernel<128,128, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
+        else                      kpc_flash_decode_qt_kernel<256,256, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
+    }
+    else if (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
     else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
     else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
     else                                        kpc_flash_decode_kernel<  0,  0><<<grid, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS);
