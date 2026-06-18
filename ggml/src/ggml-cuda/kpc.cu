@@ -820,15 +820,17 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     // tensor-core prefill path. cc>=Turing is a hard CORRECTNESS floor: the MMA intrinsics compile to NO_DEVICE_CODE
     // (trap) on older arches (Pascal etc.), so MMA must never *launch* there -- those devices fall back to the
-    // query-tiled scalar kernel. On capable hardware MMA wins once there are enough keys to amortise the f16 staging
-    // (n_kv>=2048; below that the query-tiled kernel is faster AND lossless -- see the crossover in the perf handoff).
-    // KPC_MMA tri-state override: unset = auto(n_kv>=2048); 1 = force MMA at any n_kv; 0 = force query-tiled.
+    // query-tiled scalar kernel. On capable hardware MMA wins once there are enough keys to amortise the f16 staging.
+    // Measured crossover (qwen2.5-1.5b, sm_120, after the flattened K-dequant): qt wins below ~768, MMA wins from
+    // ~768 up (pp768 +3.6%, pp1024 +3.1%, pp1536 +10.5%, growing with n_kv); threshold set to 1024 for margin.
+    // (Crossover measured at head_dim=128; 64/256 unverified, so the 1024 floor stays conservative.)
+    // KPC_MMA tri-state override: unset = auto(n_kv>=1024); 1 = force MMA at any n_kv; 0 = force query-tiled.
     static const int kpc_mma = []{ const char * e = getenv("KPC_MMA"); return e ? atoi(e) : -1; }();
     bool use_mma = false;
     if (tiled) {
         const int  dev_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool cc_mma = dev_cc >= GGML_CUDA_CC_TURING;
-        use_mma = cc_mma && ((kpc_mma == 1) || (kpc_mma == -1 && n_kv >= 2048));
+        use_mma = cc_mma && ((kpc_mma == 1) || (kpc_mma == -1 && n_kv >= 1024));
         if (kpc_mma == 1 && !cc_mma) {                              // forced on hardware that can't run MMA
             static int warned = 0;
             if (!warned) { warned = 1;
