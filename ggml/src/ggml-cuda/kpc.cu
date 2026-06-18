@@ -284,17 +284,43 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     #undef KPC_FA_ARGS
 }
 
+// shared member scan: find this (slot,g) block's new members (k_cur tokens with pos/32==g and this slot),
+// whether a later group exists (g is then not the slot's open group), and the per-member token/cell indices.
+// Fills the caller's shared newmask/has_later/tok_of/cell_of and barriers so they are ready on return.
+static __device__ __forceinline__ void kpc_scan_members(
+        const int32_t * kpc_seq, const int32_t * kpc_pos, const int64_t * k_idxs,
+        int g, int slot, int slot_shift, int nt,
+        uint32_t * s_newmask, int * s_has_later, int * tok_of, int64_t * cell_of) {
+    if (threadIdx.x == 0) { *s_newmask = 0; *s_has_later = 0; }
+    if ((int) threadIdx.x < GGML_KPC_GROUP) { tok_of[threadIdx.x] = -1; cell_of[threadIdx.x] = -1; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nt; i += blockDim.x) {
+        if ((int) ((uint32_t) kpc_seq[i] >> slot_shift) != slot) continue;
+        const int tg = kpc_pos[i] / GGML_KPC_GROUP;
+        if (tg > g) { *s_has_later = 1; continue; }             // a later token exists -> g is not the open group
+        if (tg < g) continue;
+        const int w = kpc_pos[i] % GGML_KPC_GROUP;
+        tok_of[w]  = i;
+        cell_of[w] = k_idxs[i];
+        atomicOr(s_newmask, 1u << w);
+    }
+    __syncthreads();
+}
+
 // device write (group-parallel seal). ONE block per (logical group g, staging slot). Each block gathers the
 // group's members once -- this ubatch's tokens (from k_cur) plus any previously-staged members (from k_resid
 // when g is the slot's open group) -- computes the per-channel scale/zp a single time, encodes the scalezp
-// slab and packs every member into its GLOBAL K cell (k_idxs for new, k_resid_slots for staged). Only the
-// slot's OPEN group (the last one, with no later token this ubatch) touches the staging tensors, so distinct
-// blocks never race on them. Replaces the old 1-block, serial-over-tokens kernel that re-encoded each group
-// ~32x. Uses only on-chip shared memory (no device scratch -> no extra VRAM). Multi-stream: stream = seq/n_seqps,
+// slab and packs every member into its GLOBAL K cell (k_idxs for new, k_resid_slots for staged). Uses only
+// on-chip shared memory (no device scratch -> no extra VRAM). Multi-stream: stream = seq/n_seqps,
 // pool = (seq%n_seqps)*band_size + g%band_size (mirrors the CPU pool_of). No rescue/virtualization.
+// NOTE: this kernel only READS the staging tensors (staged_group/staged_mask/k_resid/resid_slots) -- the
+// staging UPDATE for the next ubatch is a SEPARATE launch (kpc_write_stage_kernel) so the seal never races a
+// concurrent staging write (the open-group block used to overwrite staging that sibling blocks were still
+// reading -> non-deterministic corruption, exposed by Blackwell's independent thread scheduling).
 static __global__ void kpc_write_kernel(
         const float * k_cur, const int32_t * kpc_seq, const int32_t * kpc_pos, const int64_t * k_idxs,
-        half * k_resid, uint8_t * scalezp, int32_t * resid_slots, int32_t * staged_group, int32_t * staged_mask,
+        const half * k_resid, uint8_t * scalezp, const int32_t * resid_slots,
+        const int32_t * staged_group, const int32_t * staged_mask,
         uint8_t * K, int C, int nt, int slot_shift, int seq_mask, int L,
         int n_seqps, int band_size, int64_t sz_nb1, int64_t sz_nb2, int64_t k_nb1) {
     const int g    = blockIdx.x;     // logical 32-token group
@@ -308,21 +334,7 @@ static __global__ void kpc_write_kernel(
     __shared__ int      has_later;
     __shared__ int      tok_of[GGML_KPC_GROUP];    // k_cur token index that wrote within-group slot w (-1 none)
     __shared__ int64_t  cell_of[GGML_KPC_GROUP];   // global K cell for a new member w
-    if (threadIdx.x == 0) { newmask = 0; has_later = 0; }
-    if ((int) threadIdx.x < GGML_KPC_GROUP) { tok_of[threadIdx.x] = -1; cell_of[threadIdx.x] = -1; }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < nt; i += blockDim.x) {        // find this (slot,g)'s new members + any later group
-        if ((int) ((uint32_t) kpc_seq[i] >> slot_shift) != slot) continue;
-        const int tg = kpc_pos[i] / GGML_KPC_GROUP;
-        if (tg > g) { has_later = 1; continue; }                // a later token exists -> g is not the open group
-        if (tg < g) continue;
-        const int w = kpc_pos[i] % GGML_KPC_GROUP;
-        tok_of[w]  = i;
-        cell_of[w] = k_idxs[i];
-        atomicOr(&newmask, 1u << w);
-    }
-    __syncthreads();
+    kpc_scan_members(kpc_seq, kpc_pos, k_idxs, g, slot, slot_shift, nt, &newmask, &has_later, tok_of, cell_of);
 
     const uint32_t omask   = (g == staged_group[slot]) ? (uint32_t) staged_mask[slot] : 0u;   // staged members of g
     const uint32_t members = newmask | omask;
@@ -331,7 +343,7 @@ static __global__ void kpc_write_kernel(
     const int sb   = slot;                                      // slot == seq (non-virtualized)
     const int st   = sb / n_seqps;                              // physical stream
     const int pool = (sb % n_seqps) * band_size + (g % band_size);
-    half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
+    const half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
 
     // per-channel min/max over members (new from k_cur f32, staged-only from k_resid f16)
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
@@ -380,16 +392,38 @@ static __global__ void kpc_write_kernel(
             row[b] = (uint8_t)(q0 | (q1 << 4));
         }
     }
-    __syncthreads();
-    // staging update: only the OPEN group (no later token this ubatch) persists the window for the next ubatch.
-    if (!has_later) {
-        for (int w = 0; w < GGML_KPC_GROUP; ++w) {
-            if (!(newmask & (1u << w))) continue;
-            for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(k_cur[(size_t) tok_of[w] * C + c]);
-            if (threadIdx.x == 0) resid_slots[slot * GGML_KPC_GROUP + w] = (int32_t) cell_of[w];
-        }
-        if (threadIdx.x == 0) { staged_group[slot] = g; staged_mask[slot] = (int32_t) members; }
+}
+
+// staging update (SEPARATE launch, runs after kpc_write_kernel on the same stream so the seal has finished and
+// its reads of the OLD staging are complete). Only the slot's OPEN group (no later token this ubatch) persists
+// the residual window + staged_group/staged_mask for the next ubatch. Non-open blocks bail before touching the
+// staging tensors, so exactly one block per slot writes them -> no inter-block race.
+static __global__ void kpc_write_stage_kernel(
+        const float * k_cur, const int32_t * kpc_seq, const int32_t * kpc_pos, const int64_t * k_idxs,
+        half * k_resid, int32_t * resid_slots, int32_t * staged_group, int32_t * staged_mask,
+        int C, int nt, int slot_shift, int L) {
+    const int g    = blockIdx.x;
+    const int slot = blockIdx.y;
+    if (slot >= L) return;
+
+    __shared__ uint32_t newmask;
+    __shared__ int      has_later;
+    __shared__ int      tok_of[GGML_KPC_GROUP];
+    __shared__ int64_t  cell_of[GGML_KPC_GROUP];
+    kpc_scan_members(kpc_seq, kpc_pos, k_idxs, g, slot, slot_shift, nt, &newmask, &has_later, tok_of, cell_of);
+
+    if (has_later) return;                                      // not the open group -> never touches staging
+    const uint32_t omask   = (g == staged_group[slot]) ? (uint32_t) staged_mask[slot] : 0u;
+    const uint32_t members = newmask | omask;
+    if (members == 0) return;
+
+    half * rsd = k_resid + (size_t) slot * C * GGML_KPC_GROUP;
+    for (int w = 0; w < GGML_KPC_GROUP; ++w) {
+        if (!(newmask & (1u << w))) continue;                  // staged members already have residual + slot
+        for (int c = threadIdx.x; c < C; c += blockDim.x) rsd[(size_t) w * C + c] = __float2half(k_cur[(size_t) tok_of[w] * C + c]);
+        if (threadIdx.x == 0) resid_slots[slot * GGML_KPC_GROUP + w] = (int32_t) cell_of[w];
     }
+    if (threadIdx.x == 0) { staged_group[slot] = g; staged_mask[slot] = (int32_t) members; }
 }
 
 void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -419,6 +453,13 @@ void ggml_cuda_kpc_write(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         (int32_t *) rslots->data, (int32_t *) sgrp->data, (int32_t *) smask->data, (uint8_t *) dst->data,
         C, nt, GGML_KPC_SLOT_SHIFT, GGML_KPC_SEQ_MASK, L,
         n_seqps, band_size, scalezp->nb[1], scalezp->nb[2], dst->nb[1]);
+    // SECOND launch: persist the staging window. Serialized after the seal on the same stream, so the seal's
+    // reads of the OLD staging are done before this writes the NEW staging -> no inter-block staging race.
+    kpc_write_stage_kernel<<<grid, 256, 0, ctx.stream()>>>(
+        (const float *) k_cur->data, (const int32_t *) kseq->data, (const int32_t *) kpos->data,
+        (const int64_t *) k_idxs->data, (half *) k_resid->data,
+        (int32_t *) rslots->data, (int32_t *) sgrp->data, (int32_t *) smask->data,
+        C, nt, GGML_KPC_SLOT_SHIFT, L);
 }
 
 // ---- dequant: packed int4 K [C,n_kv,ns] -> f16, positional pool = cell>>5 per stream (RoPE shift / state) ----
