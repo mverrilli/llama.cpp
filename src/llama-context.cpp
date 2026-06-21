@@ -3565,12 +3565,12 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    // the KPC attention kernels only decode q4_1 and f16 V; any other V type would be misread as f16
+    // the KPC attention kernels decode q4_1, q4_0 and f16 V; any other V type would be misread as f16
     if (params.type_k == GGML_TYPE_KPC4_1 &&
-        params.type_v != GGML_TYPE_Q4_1 && params.type_v != GGML_TYPE_F16) {
-        LLAMA_LOG_ERROR("%s: kpc4_1 K cache supports only q4_1 or f16 V cache; V type '%s' is not supported by the "
-            "KPC attention kernels. Use -ctv q4_1 (recommended) or -ctv f16\n",
-            __func__, ggml_type_name(params.type_v));
+        params.type_v != GGML_TYPE_Q4_1 && params.type_v != GGML_TYPE_Q4_0 && params.type_v != GGML_TYPE_F16) {
+        LLAMA_LOG_ERROR("%s: kpc4_1 K cache supports only q4_1, q4_0 or f16 V cache; V type '%s' is not supported by "
+            "the KPC attention kernels. Use -ctv q4_1 (recommended, q8-class), -ctv q4_0 (smaller, exact q4_0 size) "
+            "or -ctv f16\n", __func__, ggml_type_name(params.type_v));
         return nullptr;
     }
 

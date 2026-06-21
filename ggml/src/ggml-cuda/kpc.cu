@@ -15,7 +15,7 @@ static bool kpc_flash_prefill_stock(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * Q, const ggml_tensor * Kp, const ggml_tensor * sz, const ggml_tensor * V,
         const ggml_tensor * mask, const ggml_tensor * gi, const ggml_tensor * sinks, const float * params,
-        int head_dim, int DV, int C_full, int n_kv, int n_kvh, int n_vh, int n_stream, bool v_q41);
+        int head_dim, int DV, int C_full, int n_kv, int n_kvh, int n_vh, int n_stream, bool v_q41, bool v_q40);
 
 // per-channel int4 dequant: c even -> low nibble, c odd -> high.  v = q*scale[c] + zp[c]
 static __device__ __forceinline__ float kpc_deq_nib(uint8_t nb, int c, float s, float z) {
@@ -35,6 +35,24 @@ static __device__ __forceinline__ void kpc_slab_super(const uint8_t * s, float *
     h = *(const half *)(s + 4); *sz  = __half2float(h);
 }
 
+// V-cache dequant for element d of a row: f16 (v_q41=v_q40=0), q4_1 (20B block, nib*d+m), or q4_0 (18B block,
+// (nib-8)*d -- symmetric, 2B smaller/block so the KV reaches exact q4_0 size; opt-in via -ctv q4_0).
+static __device__ __forceinline__ float kpc_deq_v(const uint8_t * vrow, int d, bool v_q41, bool v_q40) {
+    const int dj = d % 32;
+    if (v_q41) {
+        const uint8_t * blk = vrow + (d / 32) * 20;                  // [f16 d][f16 m][16B nibbles]
+        const float vd = __half2float(*(const half *)(blk + 0)), vm = __half2float(*(const half *)(blk + 2));
+        const uint8_t b = blk[4 + (dj % 16)];
+        return ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
+    }
+    if (v_q40) {
+        const uint8_t * blk = vrow + (d / 32) * 18;                  // [f16 d][16B nibbles], symmetric (nib-8)*d
+        const float vd = __half2float(*(const half *)(blk + 0));
+        const uint8_t b = blk[2 + (dj % 16)];
+        return (((dj < 16) ? (b & 0x0F) : (b >> 4)) - 8) * vd;
+    }
+    return __half2float(((const half *) vrow)[d]);                   // f16
+}
 // flash-decode read (mirrors the CPU kpc flash-attn indexing): 1 block per (head, query, stream); online softmax over sealed K, q4_1/f16 V.
 // K is [head_dim, n_kv, n_kvh, ns] sliced by kv-head via k_nb2; the scalezp slab carries all
 // C_full=n_embd_k_gqa channels, so the head's slice starts at cbase=ik2*head_dim.
@@ -60,12 +78,12 @@ template<int DV_T> struct kpc_dec_bounds { static constexpr int min_blocks = (DV
 #else
 #  define KPC_DEC_LAUNCH_BOUNDS
 #endif
-template<int DK_T, int DV_T>
+template<int DK_T, int DV_T, bool VQ41>
 static __global__ void KPC_DEC_LAUNCH_BOUNDS kpc_flash_decode_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
         const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
         int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
-        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41, bool v_q40,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
         int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
         int64_t sz_nb1, int64_t sz_nb2,
@@ -165,17 +183,7 @@ static __global__ void KPC_DEC_LAUNCH_BOUNDS kpc_flash_decode_kernel(
         for (int j = 0; j < ndv; ++j) {
             const int d = lane + j * 32;
             if (d >= DV) break;
-            float vv;
-            if (v_q41) {
-                const uint8_t * blk = vrow + (d / 32) * 20;          // q4_1 block: [f16 d][f16 m][16B nibbles]
-                const float vd = __half2float(*(const half *)(blk + 0));
-                const float vm = __half2float(*(const half *)(blk + 2));
-                const int dj = d % 32;
-                const uint8_t b = blk[4 + (dj % 16)];
-                vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
-            } else {
-                vv = __half2float(((const half *) vrow)[d]);
-            }
+            const float vv = kpc_deq_v(vrow, d, VQ41, !VQ41 && v_q40);
             acc[j] = acc[j] * a + p * vv;
         }
         m = mn;
@@ -244,12 +252,12 @@ static __global__ void KPC_DEC_LAUNCH_BOUNDS kpc_flash_decode_kernel(
 // per-channel-scale cost, divided by QT). Each query keeps its own qp/corr/m/l/acc. Grid x =
 // n_kvh*ceil(rk2/QT); 1 warp/block; grid split-K via blockIdx.y; the existing combine renormalises per query
 // head (partials emitted at the per-head part_idx). Positional pools; GQA only (rk2>=2, rk2==rv2).
-template<int DK_T, int DV_T, int QT>
+template<int DK_T, int DV_T, int QT, bool VQ41>
 static __global__ void KPC_DEC_LAUNCH_BOUNDS kpc_flash_decode_gqa(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
         const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
         int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
-        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41, bool v_q40,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
         int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
         int64_t sz_nb1, int64_t sz_nb2,
@@ -349,15 +357,7 @@ static __global__ void KPC_DEC_LAUNCH_BOUNDS kpc_flash_decode_gqa(
         for (int j = 0; j < NACC; ++j) {                     // load each V element once, apply to QT queries
             const int d = lane + j * 32;
             if (d >= DV) break;
-            float vv;
-            if (v_q41) {
-                const uint8_t * blk = vrow + (d / 32) * 20;
-                const float vd = __half2float(*(const half *)(blk + 0)), vm = __half2float(*(const half *)(blk + 2));
-                const int dj = d % 32; const uint8_t b = blk[4 + (dj % 16)];
-                vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
-            } else {
-                vv = __half2float(((const half *) vrow)[d]);
-            }
+            const float vv = kpc_deq_v(vrow, d, VQ41, !VQ41 && v_q40);
             #pragma unroll
             for (int i = 0; i < QT; ++i) acc[i][j] = acc[i][j] * a_i[i] + p_i[i] * vv;
         }
@@ -418,12 +418,12 @@ static __global__ void kpc_flash_combine_kernel(
 
 // query-tiled flash-decode read: 1 warp per (head, query-tile of QT, stream). Each key's K nibbles + V row
 // are loaded once and reused for all QT queries in the tile. Single warp only (no split-K) -> prefill path.
-template<int DK_T, int DV_T, int QT>
+template<int DK_T, int DV_T, int QT, bool VQ41>
 static __global__ void kpc_flash_decode_qt_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
         const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
         int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
-        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41, bool v_q40,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
         int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
         int64_t sz_nb1, int64_t sz_nb2,
@@ -509,16 +509,7 @@ static __global__ void kpc_flash_decode_qt_kernel(
         for (int j = 0; j < ndv; ++j) {
             const int d = lane + j * 32;
             if (d >= DV) { vv[j] = 0.0f; continue; }
-            if (v_q41) {
-                const uint8_t * blk = vrow + (d / 32) * 20;
-                const float vd = __half2float(*(const half *)(blk + 0));
-                const float vm = __half2float(*(const half *)(blk + 2));
-                const int dj = d % 32;
-                const uint8_t b = blk[4 + (dj % 16)];
-                vv[j] = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
-            } else {
-                vv[j] = __half2float(((const half *) vrow)[d]);
-            }
+            vv[j] = kpc_deq_v(vrow, d, VQ41, !VQ41 && v_q40);
         }
         #pragma unroll
         for (int r = 0; r < QT; ++r) {
@@ -566,7 +557,7 @@ static __global__ void kpc_flash_prefill_kernel(
         const float * Q, const uint8_t * Kp, const uint8_t * sz0, const uint8_t * V, const half * mask,
         const float * sinks, const int32_t * gid, int gi_stride, float kqscale, float max_bias, float logit_softcap, float * dst,
         int head_dim_rt, int DV_rt, int C_full, int n_kv, int n_head, int n_q, int n_kvh, int n_vh, int n_stream,
-        int rk2, int rv2, int rk3, int rv3, bool v_q41,
+        int rk2, int rv2, int rk3, int rv3, bool v_q41, bool v_q40,
         int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
         int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
         int64_t sz_nb1, int64_t sz_nb2,
@@ -749,16 +740,7 @@ static __global__ void kpc_flash_prefill_kernel(
                 float vv = 0.0f;
                 if (k < knv) {
                     const uint8_t * vrow = (const uint8_t *) V + (size_t)(kt + k) * v_nb1 + (size_t) iv2 * v_nb2 + (size_t) iv3 * v_nb3;
-                    if (v_q41) {
-                        const uint8_t * blk = vrow + (d / 32) * 20;
-                        const float vd = __half2float(*(const half *)(blk + 0));
-                        const float vm = __half2float(*(const half *)(blk + 2));
-                        const int dj = d % 32;
-                        const uint8_t b = blk[4 + (dj % 16)];
-                        vv = ((dj < 16) ? (b & 0x0F) : (b >> 4)) * vd + vm;
-                    } else {
-                        vv = __half2float(((const half *) vrow)[d]);
-                    }
+                    vv = kpc_deq_v(vrow, d, v_q41, v_q40);
                 }
                 Vf[d * KPC_KN + k] = __float2half(vv);
             }
@@ -839,6 +821,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int rk2 = n_head / n_kvh, rv2 = n_head / n_vh;
     const int rk3 = n_stream / (int) Kp->ne[3], rv3 = n_stream / (int) V->ne[3];
     const bool v_q41 = V->type == GGML_TYPE_Q4_1;
+    const bool v_q40 = V->type == GGML_TYPE_Q4_0;   // opt-in -ctv q4_0: smaller V (18B/block) -> exact q4_0 KV size
 
     // Single-token decode (n_q==1) kernel choice. The dequant-once -> stock VEC helper must rewrite the whole int4
     // cache to an f16 scratch every step (materialise ~ n_kv*n_kvh*head_dim); the custom kernel reads in place but
@@ -861,7 +844,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         (head_dim == 64 || head_dim == 128 || head_dim == 256) && n_kv >= 256 &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= GGML_CUDA_CC_TURING &&
         kpc_flash_prefill_stock(ctx, dst, Q, Kp, sz, V, mask, gi, sinks, params,
-                                head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41)) {
+                                head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41, v_q40)) {
         return;
     }
 
@@ -879,10 +862,14 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (n_split > 1) {
         cudaFuncAttributes fa{};
         cudaError_t fe;
-        if      (head_dim == DV && head_dim ==  64) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel< 64, 64>);
-        else if (head_dim == DV && head_dim == 128) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<128,128>);
-        else if (head_dim == DV && head_dim == 256) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<256,256>);
-        else                                        fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<  0,  0>);
+        #define KPC_FA_ATTR(VQ) do { \
+            if      (head_dim == DV && head_dim ==  64) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel< 64, 64, VQ>); \
+            else if (head_dim == DV && head_dim == 128) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<128,128, VQ>); \
+            else if (head_dim == DV && head_dim == 256) fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<256,256, VQ>); \
+            else                                        fe = cudaFuncGetAttributes(&fa, kpc_flash_decode_kernel<  0,  0, VQ>); \
+        } while (0)
+        if (v_q41) KPC_FA_ATTR(true); else KPC_FA_ATTR(false);
+        #undef KPC_FA_ATTR
         if (fe == cudaSuccess && fa.maxThreadsPerBlock > 0)
             while (n_split > 1 && 32 * n_split > fa.maxThreadsPerBlock) n_split /= 2;
     }
@@ -910,7 +897,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride, \
         params[0], params[1], params[2], (float *) dst->data, \
         head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream, \
-        rk2, rv2, rk3, rv3, v_q41, \
+        rk2, rv2, rk3, rv3, v_q41, v_q40, \
         Q->nb[1], Q->nb[2], Q->nb[3], \
         Kp->nb[1], Kp->nb[2], Kp->nb[3], \
         sz->nb[1], sz->nb[2], \
@@ -973,15 +960,19 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (const uint8_t *) V->data, mask ? (const half *) mask->data : nullptr, \
             sinks ? (const float *) sinks->data : nullptr, gi ? (const int32_t *) gi->data : nullptr, gi_stride2, \
             params[0], params[1], params[2], (float *) dst->data, \
-            head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream, rk2, rv2, rk3, rv3, v_q41, \
+            head_dim, DV, C_full, n_kv, n_head, n_q, n_kvh, n_vh, n_stream, rk2, rv2, rk3, rv3, v_q41, v_q40, \
             Q->nb[1], Q->nb[2], Q->nb[3], Kp->nb[1], Kp->nb[2], Kp->nb[3], sz->nb[1], sz->nb[2], \
             V->nb[1], V->nb[2], V->nb[3], \
             mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0, \
             mask ? (int) mask->ne[2] : 1, mask ? (int) mask->ne[3] : 1, \
             dst->nb[1], (int) dst->ne[1], (int) dst->ne[2], 1, pg, mg, kvs
-        if      (head_dim ==  64) kpc_flash_decode_gqa< 64, 64, GQA_QT><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS);
-        else if (head_dim == 128) kpc_flash_decode_gqa<128,128, GQA_QT><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS);
-        else                      kpc_flash_decode_gqa<256,256, GQA_QT><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS);
+        #define KPC_GQA_LAUNCH(VQ) do { \
+            if      (head_dim ==  64) kpc_flash_decode_gqa< 64, 64, GQA_QT, VQ><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS); \
+            else if (head_dim == 128) kpc_flash_decode_gqa<128,128, GQA_QT, VQ><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS); \
+            else                      kpc_flash_decode_gqa<256,256, GQA_QT, VQ><<<gridG, 32, 0, ctx.stream()>>>(KPC_GQA_ARGS); \
+        } while (0)
+        if (v_q41) KPC_GQA_LAUNCH(true); else KPC_GQA_LAUNCH(false);
+        #undef KPC_GQA_LAUNCH
         #undef KPC_GQA_ARGS
         if (kvs > 1) {
             const int    cthreads = DV < 1024 ? DV : 1024;
@@ -1023,7 +1014,7 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // keeps the custom kernel.
         const bool done = n_stream == 1 &&
             kpc_flash_prefill_stock(ctx, dst, Q, Kp, sz, V, mask, gi, sinks, params,
-                                    head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41);
+                                    head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41, v_q40);
         if (!done) {
             dim3 gridM(n_head, (n_q + KPC_QM - 1) / KPC_QM, n_stream);
             const size_t smem_m = (size_t)(KPC_QM * head_dim + KPC_KN * head_dim + DV * KPC_KN + KPC_QM * KPC_KN) * sizeof(half)
@@ -1042,19 +1033,29 @@ void ggml_cuda_kpc_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // n_stream==1 (the dequant omits the custom kernel's stream-broadcast ratios).
         const bool done = dec_cc < GGML_CUDA_CC_TURING && n_stream == 1 &&
             kpc_flash_prefill_stock(ctx, dst, Q, Kp, sz, V, mask, gi, sinks, params,
-                                    head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41);
+                                    head_dim, DV, C_full, n_kv, n_kvh, n_vh, n_stream, v_q41, v_q40);
         if (!done) {
             const int QT = 3;
             dim3 gridT(n_head, (n_q + QT - 1) / QT, n_stream);
-            if      (head_dim ==  64) kpc_flash_decode_qt_kernel< 64, 64, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
-            else if (head_dim == 128) kpc_flash_decode_qt_kernel<128,128, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
-            else                      kpc_flash_decode_qt_kernel<256,256, 3><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS);
+            #define KPC_QT_LAUNCH(VQ) do { \
+                if      (head_dim ==  64) kpc_flash_decode_qt_kernel< 64, 64, 3, VQ><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS); \
+                else if (head_dim == 128) kpc_flash_decode_qt_kernel<128,128, 3, VQ><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS); \
+                else                      kpc_flash_decode_qt_kernel<256,256, 3, VQ><<<gridT, 32, 0, ctx.stream()>>>(KPC_FA_ARGS); \
+            } while (0)
+            if (v_q41) KPC_QT_LAUNCH(true); else KPC_QT_LAUNCH(false);
+            #undef KPC_QT_LAUNCH
         }
     }
-    else if (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
-    else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
-    else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
-    else                                        kpc_flash_decode_kernel<  0,  0><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC);
+    else {
+        #define KPC_DEC_LAUNCH(VQ) do { \
+            if      (head_dim == DV && head_dim ==  64) kpc_flash_decode_kernel< 64, 64, VQ><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC); \
+            else if (head_dim == DV && head_dim == 128) kpc_flash_decode_kernel<128,128, VQ><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC); \
+            else if (head_dim == DV && head_dim == 256) kpc_flash_decode_kernel<256,256, VQ><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC); \
+            else                                        kpc_flash_decode_kernel<  0,  0, VQ><<<gridR, nthreads, smem, ctx.stream()>>>(KPC_FA_ARGS KPC_FA_DEC); \
+        } while (0)
+        if (v_q41) KPC_DEC_LAUNCH(true); else KPC_DEC_LAUNCH(false);
+        #undef KPC_DEC_LAUNCH
+    }
 
     if (kv_split > 1) {                                              // renormalise the kv_split partials into dst
         const int    cthreads = DV < 1024 ? DV : 1024;
@@ -1482,25 +1483,33 @@ void ggml_cuda_kpc_dequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         C, n_kv, ns, pk->nb[1], pk->nb[2], sz->nb[1], sz->nb[2], dst->nb[1], dst->nb[2]);
 }
 
-// Coalesced q4_1 V-cache dequant -> contiguous f16 [DV, n_kv, n_vh, ns]. The stock to_fp16_nc converter runs this
-// at ~19% peak BW for the decode V shape (3x slower than the grouped K dequant on the same element count); a
-// warp's 32 lanes here read consecutive d (same q4_1 block's d/m broadcast, consecutive nibbles) and write
-// consecutive f16. q4_1 block = 20 bytes: half d, half m, then 16 nibble-bytes (val[j] = d*nib + m).
-static __global__ void kpc_vdeq_q41_kernel(
+// Coalesced q4_1/q4_0 V-cache dequant -> contiguous f16 [DV, n_kv, n_vh, ns]. The stock to_fp16_nc converter runs
+// this at ~19% peak BW for the decode V shape (3x slower than the grouped K dequant on the same element count); a
+// warp's 32 lanes here read consecutive d (same block's d/m broadcast, consecutive nibbles) and write consecutive
+// f16. q4_1 block = 20B [half d][half m][16 nib] (val = nib*d + m); q4_0 = 18B [half d][16 nib] (val = (nib-8)*d).
+template<bool Q41>
+static __global__ void kpc_vdeq_kernel(
         const uint8_t * V, half * dst, int DV, int n_kv, int n_vh, int ns,
-        int64_t s1, int64_t s2, int64_t s3) {   // q4_1-block strides for kv, vh, ns
+        int64_t s1, int64_t s2, int64_t s3) {   // block strides (V->nb/type_size) for kv, vh, ns
+    const int  bs    = Q41 ? 20 : 18;            // bytes per 32-element block
     const long total = (long) DV * n_kv * n_vh * ns;
     for (long idx = (long) blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (long) gridDim.x * blockDim.x) {
         const int  d  = (int)(idx % DV); long t = idx / DV;
         const int  kv = (int)(t % n_kv); t /= n_kv;
         const int  vh = (int)(t % n_vh); const int s = (int)(t / n_vh);
-        const uint8_t * blk = V + (size_t) 20 * ((size_t) s * s3 + (size_t) vh * s2 + (size_t) kv * s1 + (size_t)(d >> 5));
+        const uint8_t * blk = V + (size_t) bs * ((size_t) s * s3 + (size_t) vh * s2 + (size_t) kv * s1 + (size_t)(d >> 5));
         const int j = d & 31;
         const float dd = __half2float(*(const half *)(blk + 0));
-        const float mm = __half2float(*(const half *)(blk + 2));
-        const uint8_t q = blk[4 + (j & 15)];
-        const int nib = (j < 16) ? (q & 0xF) : (q >> 4);
-        dst[(size_t) DV * ((size_t) kv + (size_t) n_kv * ((size_t) vh + (size_t) n_vh * s)) + d] = __float2half(dd * nib + mm);
+        float vv;
+        if (Q41) {
+            const float mm = __half2float(*(const half *)(blk + 2));
+            const uint8_t q = blk[4 + (j & 15)];
+            vv = ((j < 16) ? (q & 0xF) : (q >> 4)) * dd + mm;
+        } else {
+            const uint8_t q = blk[2 + (j & 15)];
+            vv = (((j < 16) ? (q & 0xF) : (q >> 4)) - 8) * dd;
+        }
+        dst[(size_t) DV * ((size_t) kv + (size_t) n_kv * ((size_t) vh + (size_t) n_vh * s)) + d] = __float2half(vv);
     }
 }
 
@@ -1514,7 +1523,7 @@ static bool kpc_flash_prefill_stock(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_tensor * Q, const ggml_tensor * Kp, const ggml_tensor * sz, const ggml_tensor * V,
         const ggml_tensor * mask, const ggml_tensor * gi, const ggml_tensor * sinks, const float * params,
-        int head_dim, int DV, int C_full, int n_kv, int n_kvh, int n_vh, int n_stream, bool v_q41) {
+        int head_dim, int DV, int C_full, int n_kv, int n_kvh, int n_vh, int n_stream, bool v_q41, bool v_q40) {
     // head_dim == DV is guaranteed by the caller's `tiled` gate; the stock path also requires V->ne[0]==K->ne[0].
     // --- K: int4 -> f16 [C_full, n_kv, ns] (one dequant pass over the whole cache) ---
     ggml_cuda_pool_alloc<half> Kf16(ctx.pool(), (size_t) C_full * n_kv * n_stream);
@@ -1529,21 +1538,22 @@ static bool kpc_flash_prefill_stock(
     ggml_cuda_pool_alloc<half> Vf16(ctx.pool());
     const half * V_data = (const half *) V->data;
     int64_t v_nb1 = V->nb[1], v_nb2 = V->nb[2], v_nb3 = V->nb[3];
-    if (v_q41) {
+    if (v_q41 || v_q40) {
         Vf16.alloc((size_t) DV * n_kv * n_vh * n_stream);
-        const size_t ts = ggml_type_size(GGML_TYPE_Q4_1);
+        const ggml_type vt = v_q41 ? GGML_TYPE_Q4_1 : GGML_TYPE_Q4_0;
+        const size_t ts = ggml_type_size(vt);
         // Small heads (qwen2 DV=64): the stock to_fp16_nc is launch/overhead-bound (~19% peak BW) and the custom
-        // coalesced dequant is ~3x faster (qwen2 decode +6%). Large heads (gemma2 DV=256): the stock kernel's
-        // vectorized loads win, so keep it.
+        // coalesced dequant is ~3x faster (qwen2 decode +6%); it handles both q4_1 and q4_0 (templated). Large heads
+        // (gemma2 DV=256): the stock kernel's vectorized loads win.
         const bool use_custom_vdeq = (DV <= 64);
         if (use_custom_vdeq) {
             const long vtot = (long) DV * n_kv * n_vh * n_stream;
             int vblocks = (int)((vtot + 255) / 256); if (vblocks < 1) vblocks = 1; if (vblocks > 65535) vblocks = 65535;
-            kpc_vdeq_q41_kernel<<<vblocks, 256, 0, ctx.stream()>>>(
-                (const uint8_t *) V->data, Vf16.ptr, DV, n_kv, n_vh, n_stream,
-                V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts);
+            const int64_t s1 = V->nb[1] / ts, s2 = V->nb[2] / ts, s3 = V->nb[3] / ts;
+            if (v_q41) kpc_vdeq_kernel<true ><<<vblocks, 256, 0, ctx.stream()>>>((const uint8_t *) V->data, Vf16.ptr, DV, n_kv, n_vh, n_stream, s1, s2, s3);
+            else       kpc_vdeq_kernel<false><<<vblocks, 256, 0, ctx.stream()>>>((const uint8_t *) V->data, Vf16.ptr, DV, n_kv, n_vh, n_stream, s1, s2, s3);
         } else {
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(GGML_TYPE_Q4_1);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(vt);
             to_fp16(V->data, Vf16.ptr, DV, n_kv, n_vh, n_stream,
                     V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, ctx.stream());
         }
