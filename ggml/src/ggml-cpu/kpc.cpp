@@ -734,11 +734,14 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
     const int32_t            * kpc_pos = (const int32_t *) dst->src[9]->data;   // true position per token I32 [n_tokens]
 
     // n_seqps sequences share one stream; each owns a band_size scalezp pool band so they never collide.
-    // the staging slabs are sized per sequence (staged_group->ne[0] == n_seq_max)
+    // staged_group is 2D [1+KPC_GROUP, n_seq_max]: row 0 = the open group per slot (used here), rows 1.. = the CUDA
+    // survivor cell-list (host-filled, unused by the CPU path which does its own gid-based rescue). So the slot count
+    // is ne[1], and the group of slot `s` is sgp[sg_stride*s] (row 0).
     const int64_t   kv_size   = dst->ne[1];
     const int64_t   ng_max    = sz->ne[1];
     const int64_t   n_stream  = dst->src[1]->ne[2];
-    const int64_t   n_seq_max = dst->src[6]->ne[0];
+    const int64_t   n_seq_max = dst->src[6]->ne[1];
+    const int64_t   sg_stride = dst->src[6]->ne[0];   // = 1 + KPC_GROUP
     GGML_ASSERT(n_stream >= 1 && n_seq_max >= n_stream);
     const int64_t   n_seqps   = n_seq_max / n_stream;
     GGML_ASSERT(n_seqps >= 1);
@@ -786,8 +789,8 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
         if (seq_hi[sb] < 0) {
             continue;
         }
-        if (smk[sb] != 0 && sgp[sb] >= seq_lo[sb] && sgp[sb] <= seq_hi[sb]) {
-            work.emplace_back(sb, (int64_t) sgp[sb]);
+        if (smk[sb] != 0 && sgp[sg_stride*sb] >= seq_lo[sb] && sgp[sg_stride*sb] <= seq_hi[sb]) {
+            work.emplace_back(sb, (int64_t) sgp[sg_stride*sb]);
         }
     }
     auto pool_of = [&](int64_t sb, int64_t lg) -> int64_t {
@@ -827,7 +830,7 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
             tok_of[w] = t;
             slot_of[w] = idxd[t] % kv_size;   // k_idxs is global slot incl stream offset
         }
-        if (lg == sgp[sb]) {
+        if (lg == sgp[sg_stride*sb]) {
             const uint32_t prev_mask = (uint32_t) smk[sb];
             for (int64_t w = 0; w < G; ++w) {
                 if ((prev_mask & (1u << w)) && !(members & (1u << w))) {
@@ -991,7 +994,7 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
         const uint32_t members = gather(sb, lg);     // old smk/sgp still intact here
 
         if (members == full_mask) {                  // group complete
-            sgp[sb] = (int32_t) lg;
+            sgp[sg_stride*sb] = (int32_t) lg;
             smk[sb] = 0;
         } else {
             for (int64_t w = 0; w < G; ++w) {
@@ -1003,7 +1006,7 @@ void ggml_compute_forward_kpc_write(const struct ggml_compute_params * params, s
                     rsd[rbase + w*C + c] = GGML_CPU_FP32_TO_FP16(o);
                 }
             }
-            sgp[sb] = (int32_t) lg;
+            sgp[sg_stride*sb] = (int32_t) lg;
             smk[sb] = (int32_t) members;
         }
     }

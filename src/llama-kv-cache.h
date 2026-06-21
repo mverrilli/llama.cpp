@@ -329,6 +329,8 @@ private:
     void kpc_free_cell(uint32_t strm, uint32_t i) const;
     // reset all KPC bookkeeping: staging and group_index (-1)
     void kpc_reset_state() const;
+    // rebuild the cell->pool map (group_index) from the current cell positions on all layers
+    void kpc_rebuild_group_index() const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

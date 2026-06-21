@@ -5425,7 +5425,8 @@ struct ggml_tensor * ggml_kpc_attn(
         struct ggml_tensor  * sinks,
         float                 kq_scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        int32_t               n_seq_max) {
     if (max_bias > 0.0f) {
         GGML_ASSERT(mask);
     }
@@ -5437,7 +5438,8 @@ struct ggml_tensor * ggml_kpc_attn(
     const int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    float params[] = { kq_scale, max_bias, logit_softcap };
+    // n_seq_max > 1 selects the single-warp deterministic decode; 1 takes the split-K path
+    float params[] = { kq_scale, max_bias, logit_softcap, (float) n_seq_max };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_KPC_FLASH_ATTN;
@@ -5466,15 +5468,15 @@ struct ggml_tensor * ggml_kpc_write(
         struct ggml_tensor  * k_cur,
         struct ggml_tensor  * k_idxs,
         struct ggml_tensor  * kpc_seq,
-        struct ggml_tensor  * kpc_pos) {
+        struct ggml_tensor  * kpc_pos,
+        int32_t               n_seq_max) {
     struct ggml_tensor * result = ggml_view_tensor(ctx, k);   // alias-write in place
 
     GGML_ASSERT(kpc_seq->type == GGML_TYPE_I32 && kpc_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(kpc_seq->ne[0] == k_cur->ne[1] && kpc_pos->ne[0] == kpc_seq->ne[0]);
 
-    // op_params unused: n_tokens/kv_size/ng_max/n_seq_max all come from the src tensor shapes;
-    // zero-init for the kernel's fixed memcpy
-    int32_t params[16] = { 0 };
+    // n_seq_max is the band namespace, distinct from the staging-slot count staged_group->ne[0]
+    int32_t params[16] = { n_seq_max };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_KPC_WRITE;

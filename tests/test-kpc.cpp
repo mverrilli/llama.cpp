@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include <cmath>
 #include <cstdint>
@@ -41,7 +42,7 @@ static void build_cache(int64_t C, int64_t kv, int64_t N, const std::vector<int6
     struct ggml_tensor * rs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, C, KPC_GROUP);
     struct ggml_tensor * gi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
     struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, 1);
-    struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, 1);   // [row0=open group, rows1..=survivor cells]
     struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     memset(k->data,   0, ggml_nbytes(k));
     memset(sz->data,  0, ggml_nbytes(sz));
@@ -49,6 +50,7 @@ static void build_cache(int64_t C, int64_t kv, int64_t N, const std::vector<int6
     memset(gi->data, 0xFF, ggml_nbytes(gi));
     memset(rsl->data, 0, ggml_nbytes(rsl));
     memset(sgp->data, 0, ggml_nbytes(sgp));
+    ((int32_t *) sgp->data)[1] = -1;          // empty survivor list (no rescue): first entry terminates
     memset(smk->data, 0, ggml_nbytes(smk));   // staged_mask==0 -> no open group (fresh)
 
     int64_t head = 0;
@@ -70,7 +72,7 @@ static void build_cache(int64_t C, int64_t kv, int64_t N, const std::vector<int6
             ksd[i] = 0;
             kpd[i] = (int32_t)(head + i);      // true position
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -101,7 +103,7 @@ static void build_cache_scatter(int64_t C, int64_t kv, int64_t N, const std::vec
     struct ggml_tensor * rs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, C, KPC_GROUP);
     struct ggml_tensor * gi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
     struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, 1);
-    struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, 1);   // [row0=open group, rows1..=survivor cells]
     struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     memset(k->data,   0, ggml_nbytes(k));
     memset(sz->data,  0, ggml_nbytes(sz));
@@ -109,6 +111,7 @@ static void build_cache_scatter(int64_t C, int64_t kv, int64_t N, const std::vec
     memset(gi->data, 0xFF, ggml_nbytes(gi));
     memset(rsl->data, 0, ggml_nbytes(rsl));
     memset(sgp->data, 0, ggml_nbytes(sgp));
+    ((int32_t *) sgp->data)[1] = -1;          // empty survivor list (no rescue)
     memset(smk->data, 0, ggml_nbytes(smk));
 
     int64_t head = 0;
@@ -124,13 +127,13 @@ static void build_cache_scatter(int64_t C, int64_t kv, int64_t N, const std::vec
         int32_t * kpd = (int32_t *) kp->data;
         for (int64_t i = 0; i < cs; ++i) {
             for (int64_t c = 0; c < C; ++c) {
-                kcd[i*C + c] = src_val(c, head + i);   // value indexed by LOGICAL position (head+i)
+                kcd[i*C + c] = src_val(c, head + i);   // value indexed by logical position (head+i)
             }
             idd[i] = perm[head + i];                   // physical slot is scattered via the permutation
             ksd[i] = 0;
-            kpd[i] = (int32_t)(head + i);              // LOGICAL position
+            kpd[i] = (int32_t)(head + i);              // logical position
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -264,7 +267,7 @@ static int test_attn(int n_threads) {
         gxd[i] = (int32_t) (i / KPC_GROUP);   // contiguous: slot -> group = slot/32
     }
 
-    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f);
+    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f, 1);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, o);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -291,6 +294,119 @@ static int test_attn(int n_threads) {
         return 0;
     }
     printf("FAIL fused-attn: NMSE=%.5f maxerr=%.4f nan=%d\n", nmse, maxe, nan);
+    return 1;
+}
+
+// fused attention on the GPU backend at head dims the specialized kernels don't cover, exercising the
+// runtime-dim kpc_flash_decode_kernel<0,0> (head_dim not in {64,128,256}, or DK != DV). Skips on CPU-only builds.
+static int test_attn_cuda_dims(int n_threads, int64_t DK, int64_t DV, const char * label) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (dev == NULL) {
+        printf("SKIP attn-cuda-%s: no GPU backend\n", label);
+        return 0;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (backend == NULL) {
+        printf("SKIP attn-cuda-%s: GPU backend init failed\n", label);
+        return 0;
+    }
+
+    const int64_t NKV = 40;                                  // one full 32-group + a partial of 8
+    const int64_t ng  = (NKV + KPC_GROUP - 1) / KPC_GROUP;
+
+    std::vector<uint8_t> k_os, sz_os;
+    build_cache(DK, 64, NKV, { NKV }, n_threads, k_os, sz_os);   // 64-slot cache (group-aligned), NKV written
+    std::vector<float> kdeq;
+    dequant_cache(DK, NKV, k_os, sz_os, n_threads, kdeq);    // [NKV][DK]
+
+    std::vector<float> q(DK), vf(DV * NKV);
+    for (int64_t c = 0; c < DK; ++c) {
+        q[c] = 0.5f * sinf(0.21f*(float) c + 0.6f);
+    }
+    for (int64_t ic = 0; ic < NKV; ++ic) {
+        for (int64_t d = 0; d < DV; ++d) {
+            vf[ic*DV + d] = 0.4f * cosf(0.07f*(float) d + 0.11f*(float) ic);
+        }
+    }
+
+    // full-precision reference: softmax(q . k) . v
+    std::vector<double> sc(NKV);
+    double smax = -1e30;
+    for (int64_t ic = 0; ic < NKV; ++ic) {
+        double s = 0.0;
+        for (int64_t c = 0; c < DK; ++c) {
+            s += (double) q[c] * kdeq[ic*DK + c];
+        }
+        sc[ic] = s;
+        if (s > smax) smax = s;
+    }
+    double ssum = 0.0;
+    for (int64_t ic = 0; ic < NKV; ++ic) {
+        sc[ic] = exp(sc[ic] - smax);
+        ssum  += sc[ic];
+    }
+    std::vector<float> out_ref(DV, 0.0f);
+    for (int64_t ic = 0; ic < NKV; ++ic) {
+        const float w = (float) (sc[ic] / ssum);
+        for (int64_t d = 0; d < DV; ++d) {
+            out_ref[d] += w * vf[ic*DV + d];
+        }
+    }
+
+    // build the op on a no-alloc context, place its tensors on the GPU backend, upload, compute, read back
+    struct ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * pk = ggml_new_tensor_2d(ctx, GGML_TYPE_KPC4_1, DK, NKV);
+    struct ggml_tensor * sz = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(DK), ng);
+    struct ggml_tensor * qt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DK, 1, 1, 1);   // n_q==1 -> decode kernel
+    struct ggml_tensor * vt = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, DV, NKV, 1, 1);
+    struct ggml_tensor * mk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, NKV, 1);
+    struct ggml_tensor * gx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, NKV, 1);
+    struct ggml_tensor * o  = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f, 1);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, o);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<ggml_fp16_t> vh(DV*NKV), mh(NKV);
+    for (int64_t i = 0; i < DV*NKV; ++i) vh[i] = ggml_fp32_to_fp16(vf[i]);
+    for (int64_t i = 0; i < NKV;    ++i) mh[i] = ggml_fp32_to_fp16(0.0f);
+    std::vector<int32_t> gxd(NKV);
+    for (int64_t i = 0; i < NKV; ++i) gxd[i] = (int32_t) (i / KPC_GROUP);   // contiguous: slot -> group = slot/32
+    ggml_backend_tensor_set(pk, k_os.data(),  0, ggml_nbytes(pk));
+    ggml_backend_tensor_set(sz, sz_os.data(), 0, ggml_nbytes(sz));
+    ggml_backend_tensor_set(qt, q.data(),     0, DK * sizeof(float));
+    ggml_backend_tensor_set(vt, vh.data(),    0, ggml_nbytes(vt));
+    ggml_backend_tensor_set(mk, mh.data(),    0, ggml_nbytes(mk));
+    ggml_backend_tensor_set(gx, gxd.data(),   0, ggml_nbytes(gx));
+
+    const enum ggml_status st = ggml_backend_graph_compute(backend, gf);
+
+    std::vector<float> od(DV, 0.0f);
+    ggml_backend_tensor_get(o, od.data(), 0, DV * sizeof(float));
+
+    double se = 0.0, sref = 0.0, maxe = 0.0;
+    int nan = 0;
+    for (int64_t d = 0; d < DV; ++d) {
+        if (od[d] != od[d]) nan++;
+        const float e = fabsf(od[d] - out_ref[d]);
+        se   += (double) e * e;
+        sref += (double) out_ref[d] * out_ref[d];
+        if (e > maxe) maxe = e;
+    }
+    const double nmse = se / (sref > 0.0 ? sref : 1.0);
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(backend);
+
+    if (st == GGML_STATUS_SUCCESS && nan == 0 && nmse < 0.02 && maxe < 0.05) {
+        printf("PASS attn-cuda-%s (DK=%lld DV=%lld, decode kernel<0,0>): NMSE=%.5f maxerr=%.4f\n",
+               label, (long long) DK, (long long) DV, nmse, maxe);
+        return 0;
+    }
+    printf("FAIL attn-cuda-%s (DK=%lld DV=%lld): status=%d NMSE=%.5f maxerr=%.4f nan=%d\n",
+           label, (long long) DK, (long long) DV, (int) st, nmse, maxe, nan);
     return 1;
 }
 
@@ -394,7 +510,7 @@ static int test_attn_extras(int n_threads, float softcap, bool use_sinks, float 
         gxd[i] = (int32_t)(i / KPC_GROUP);   // group_index = slot/KPC_GROUP
     }
 
-    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, skt, 1.0f, max_bias, softcap);
+    struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, sz, vt, mk, gx, skt, 1.0f, max_bias, softcap, 1);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, o);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -570,12 +686,13 @@ static void build_cache_multiseq(int64_t C, int64_t kv, int64_t NS, int64_t npos
     struct ggml_tensor * rs  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, C, KPC_GROUP, NS);
     struct ggml_tensor * gi  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
     struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, NS);
-    struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NS);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, NS);   // per-slot [row0=group, rows1..=survivors]
     struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NS);
     memset(k->data, 0, ggml_nbytes(k));   memset(sz->data, 0, ggml_nbytes(sz));
     memset(rs->data, 0, ggml_nbytes(rs)); memset(gi->data, 0xFF, ggml_nbytes(gi));
     memset(rsl->data, 0, ggml_nbytes(rsl));
     memset(sgp->data, 0, ggml_nbytes(sgp));
+    for (int64_t s = 0; s < NS; ++s) ((int32_t *) sgp->data)[(1 + KPC_GROUP)*s + 1] = -1;   // empty survivor list per slot
     memset(smk->data, 0, ggml_nbytes(smk));
 
     struct ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, nt);
@@ -600,7 +717,7 @@ static void build_cache_multiseq(int64_t C, int64_t kv, int64_t NS, int64_t npos
     }
     GGML_ASSERT(ti == nt);
 
-    struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+    struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, (int32_t) NS);
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -642,12 +759,13 @@ static int test_multiseq(int n_threads) {
             struct ggml_tensor * rs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, C, KPC_GROUP);
             struct ggml_tensor * gi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
             struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, 1);
-            struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, 1);   // [row0=group, rows1..=survivors]
             struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
             memset(k->data, 0, ggml_nbytes(k));   memset(sz->data, 0, ggml_nbytes(sz));
             memset(rs->data, 0, ggml_nbytes(rs)); memset(gi->data, 0xFF, ggml_nbytes(gi));
             memset(rsl->data, 0, ggml_nbytes(rsl));
-            memset(sgp->data, 0, ggml_nbytes(sgp)); memset(smk->data, 0, ggml_nbytes(smk));
+            memset(sgp->data, 0, ggml_nbytes(sgp)); ((int32_t *) sgp->data)[1] = -1;   // empty survivor list
+            memset(smk->data, 0, ggml_nbytes(smk));
             struct ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, npos);
             struct ggml_tensor * id = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, npos);
             struct ggml_tensor * ks = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, npos);
@@ -660,7 +778,7 @@ static int test_multiseq(int n_threads) {
                 for (int64_t c = 0; c < C; ++c) kcd[p*C + c] = src_val_seq(sb, c, p);
                 idd[p] = p; ksd[p] = 0; kpd[p] = (int32_t) p;
             }
-            struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+            struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
             struct ggml_cgraph * gf = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf, out);
             ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -710,12 +828,13 @@ static int test_contig_batch_steps(int n_threads) {
     struct ggml_tensor * rs  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, C, KPC_GROUP, NS);
     struct ggml_tensor * gi  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
     struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, NS);
-    struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NS);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, NS);   // per-slot [row0=group, rows1..=survivors]
     struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NS);
     memset(k->data, 0, ggml_nbytes(k));   memset(sz->data, 0, ggml_nbytes(sz));
     memset(rs->data, 0, ggml_nbytes(rs)); memset(gi->data, 0xFF, ggml_nbytes(gi));
     memset(rsl->data, 0, ggml_nbytes(rsl));
     memset(sgp->data, 0, ggml_nbytes(sgp)); memset(smk->data, 0, ggml_nbytes(smk));
+    for (int64_t s = 0; s < NS; ++s) ((int32_t *) sgp->data)[(1 + KPC_GROUP)*s + 1] = -1;   // empty survivor list per slot
 
     for (int64_t p = 0; p < nsteps; ++p) {
         const int64_t nt = NS;   // one token per seq this step
@@ -733,7 +852,7 @@ static int test_contig_batch_steps(int n_threads) {
             ksd[sb] = (int32_t) sb;   // pack slot==seq
             kpd[sb] = (int32_t) p;
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, (int32_t) NS);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -763,12 +882,13 @@ static int test_contig_batch_steps(int n_threads) {
             struct ggml_tensor * rs2 = ggml_new_tensor_2d(c2, GGML_TYPE_F16, C, KPC_GROUP);
             struct ggml_tensor * gi2 = ggml_new_tensor_2d(c2, GGML_TYPE_I32, kv, 1);
             struct ggml_tensor * rsl2 = ggml_new_tensor_2d(c2, GGML_TYPE_I32, KPC_GROUP, 1);
-            struct ggml_tensor * sgp2 = ggml_new_tensor_1d(c2, GGML_TYPE_I32, 1);
+            struct ggml_tensor * sgp2 = ggml_new_tensor_2d(c2, GGML_TYPE_I32, 1 + KPC_GROUP, 1);   // [row0=group, rows1..=survivors]
             struct ggml_tensor * smk2 = ggml_new_tensor_1d(c2, GGML_TYPE_I32, 1);
             memset(k2->data, 0, ggml_nbytes(k2));   memset(sz2->data, 0, ggml_nbytes(sz2));
             memset(rs2->data, 0, ggml_nbytes(rs2)); memset(gi2->data, 0xFF, ggml_nbytes(gi2));
             memset(rsl2->data, 0, ggml_nbytes(rsl2));
-            memset(sgp2->data, 0, ggml_nbytes(sgp2)); memset(smk2->data, 0, ggml_nbytes(smk2));
+            memset(sgp2->data, 0, ggml_nbytes(sgp2)); ((int32_t *) sgp2->data)[1] = -1;   // empty survivor list
+            memset(smk2->data, 0, ggml_nbytes(smk2));
             for (int64_t p = 0; p < nsteps; ++p) {
                 struct ggml_tensor * kc = ggml_new_tensor_2d(c2, GGML_TYPE_F32, C, 1);
                 struct ggml_tensor * id = ggml_new_tensor_1d(c2, GGML_TYPE_I64, 1);
@@ -779,7 +899,7 @@ static int test_contig_batch_steps(int n_threads) {
                 ((int64_t *) id->data)[0] = p;
                 ((int32_t *) ks->data)[0] = 0;
                 ((int32_t *) kp->data)[0] = (int32_t) p;
-                struct ggml_tensor * out = ggml_kpc_write(c2, k2, sz2, rs2, gi2, rsl2, sgp2, smk2, kc, id, ks, kp);
+                struct ggml_tensor * out = ggml_kpc_write(c2, k2, sz2, rs2, gi2, rsl2, sgp2, smk2, kc, id, ks, kp, 1);
                 struct ggml_cgraph * gf = ggml_new_graph(c2);
                 ggml_build_forward_expand(gf, out);
                 ggml_graph_compute_with_ctx(c2, gf, n_threads);
@@ -973,11 +1093,12 @@ static int test_rescue(int n_threads) {
     struct ggml_tensor * rs  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, C, KPC_GROUP);
     struct ggml_tensor * gi  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
     struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, 1);
-    struct ggml_tensor * sgp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, 1);   // [row0=group, rows1..=survivors]
     struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     memset(k->data, 0, ggml_nbytes(k));     memset(sz->data, 0, ggml_nbytes(sz));
     memset(rs->data, 0, ggml_nbytes(rs));   memset(gi->data, 0xFF, ggml_nbytes(gi));
     memset(rsl->data, 0, ggml_nbytes(rsl)); memset(sgp->data, 0, ggml_nbytes(sgp));
+    ((int32_t *) sgp->data)[1] = -1;        // empty survivor list (CPU gid-based rescue is exercised here)
     memset(smk->data, 0, ggml_nbytes(smk));
 
     auto write_range = [&](int64_t p0, int64_t p1) {
@@ -993,7 +1114,7 @@ static int test_rescue(int n_threads) {
             ((int32_t *) ks->data)[i] = 0;
             ((int32_t *) kp->data)[i] = (int32_t)(p0 + i);
         }
-        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp);
+        struct ggml_tensor * out = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc, id, ks, kp, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -1031,6 +1152,214 @@ static int test_rescue(int n_threads) {
     return 1;
 }
 
+// large-range survivor source (deliberately far from the near-0 new members so a members-only
+// slab is a poor fit for the survivors -- this is what makes the rescue test discriminating)
+static float src_val_big(int64_t c, int64_t t) {
+    return 8.0f * src_val(c, t) + 5.0f;
+}
+
+// Strong survivor-rescue: seal a full 32-token group with LARGE values, then re-encode that same
+// group's pool with only a FEW new near-0 members. The survivors (committed cells NOT in this write)
+// are handed to the kernel via staged_group rows 1.. -- the CUDA path must dequant them vs the OLD slab,
+// fold them into the new joint scale and repack, so they decode back near their originals. Without the
+// rescue they decode against the members-only (near-0) foreign slab and blow up. Runs on the given
+// backend (NULL -> CPU graph_compute, the reference). empty_surv=true is the rescue-off probe.
+// Returns NMSE of the survivor cells vs their ORIGINAL large values through *nmse_out (always set);
+// the return value is the PASS/FAIL code (only meaningful when empty_surv=false).
+static int run_rescue_survivors(ggml_backend_t backend, int n_threads, bool empty_surv, double * nmse_out) {
+    const int64_t C = 128, kv = 128;            // ng_max=4, single stream -> n_seq_max=1, band_size=4, pool 0
+    const int64_t ng = kv / KPC_GROUP;
+    const int64_t G  = KPC_GROUP;
+    const int64_t n_new = 4;                     // few new members at within-group slots 0..3
+
+    // build a no-alloc context whose tensors live on `backend` (or in-RAM for CPU)
+    struct ggml_init_params ip;
+    if (backend) { ip = { ggml_tensor_overhead()*32 + ggml_graph_overhead()*2, NULL, true }; }
+    else         { ip = { (size_t) 64*1024*1024, NULL, false }; }
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * k   = ggml_new_tensor_2d(ctx, GGML_TYPE_KPC4_1, C, kv);
+    struct ggml_tensor * sz  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, KPC_SZ_GROUP_BYTES(C), ng, 1);
+    struct ggml_tensor * rs  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, C, KPC_GROUP, 1);
+    struct ggml_tensor * gi  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
+    struct ggml_tensor * rsl = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, KPC_GROUP, 1);
+    struct ggml_tensor * sgp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + KPC_GROUP, 1);
+    struct ggml_tensor * smk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    // seal pass: 32 large-valued tokens -> group 0 fully sealed in pool 0
+    struct ggml_tensor * kc1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, G);
+    struct ggml_tensor * id1 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, G);
+    struct ggml_tensor * ks1 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, G);
+    struct ggml_tensor * kp1 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, G);
+    struct ggml_tensor * w1  = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc1, id1, ks1, kp1, 1);
+
+    // re-encode pass: n_new near-0 members at the same within-group slots 0..n_new-1 (cells 0..n_new-1)
+    struct ggml_tensor * kc2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_new);
+    struct ggml_tensor * id2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_new);
+    struct ggml_tensor * ks2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new);
+    struct ggml_tensor * kp2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new);
+    struct ggml_tensor * w2  = ggml_kpc_write(ctx, k, sz, rs, gi, rsl, sgp, smk, kc2, id2, ks2, kp2, 1);
+
+    // staged inputs for each pass (host fills them on the backend after alloc)
+    std::vector<float>   kc1h(C*G),  kc2h(C*n_new);
+    std::vector<int64_t> id1h(G),    id2h(n_new);
+    std::vector<int32_t> ks1h(G, 0), ks2h(n_new, 0);
+    std::vector<int32_t> kp1h(G),    kp2h(n_new);
+    for (int64_t t = 0; t < G; ++t) {
+        for (int64_t c = 0; c < C; ++c) kc1h[t*C + c] = src_val_big(c, t);   // survivors carry the large values
+        id1h[t] = t; kp1h[t] = (int32_t) t;
+    }
+    for (int64_t t = 0; t < n_new; ++t) {
+        for (int64_t c = 0; c < C; ++c) kc2h[t*C + c] = 0.01f * src_val(c, t);   // new members near 0
+        id2h[t] = t; kp2h[t] = (int32_t) t;                                       // pos t -> group 0, cell t
+    }
+
+    // staging-state seeds
+    std::vector<int32_t> sgp_seed((1 + KPC_GROUP), 0);   // row 0 = open group 0; rows 1.. filled below
+    sgp_seed[1] = -1;                                    // seal pass starts with an empty survivor list
+    int32_t smk0 = 0;
+
+    auto upload = [&](struct ggml_tensor * t, const void * src, size_t n) {
+        if (backend) ggml_backend_tensor_set(t, src, 0, n);
+        else memcpy(t->data, src, n);
+    };
+    auto zero = [&](struct ggml_tensor * t) {
+        if (backend) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+        else memset(t->data, 0, ggml_nbytes(t));
+    };
+
+    // graph + buffer
+    struct ggml_cgraph * g1 = ggml_new_graph(ctx);
+    ggml_build_forward_expand(g1, w1);
+    struct ggml_cgraph * g2 = ggml_new_graph(ctx);
+    ggml_build_forward_expand(g2, w2);
+
+    ggml_backend_buffer_t buf = NULL;
+    if (backend) buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    // init cache state: k=0, gi=-1 (free), the rest zeroed; staging seeds
+    zero(k); zero(sz); zero(rs); zero(rsl);
+    {
+        std::vector<int32_t> gi_init(kv, -1);
+        upload(gi, gi_init.data(), gi_init.size()*sizeof(int32_t));
+    }
+    upload(sgp, sgp_seed.data(), sgp_seed.size()*sizeof(int32_t));
+    upload(smk, &smk0, sizeof(int32_t));
+
+    // pass 1: seal the full group
+    upload(kc1, kc1h.data(), kc1h.size()*sizeof(float));
+    upload(id1, id1h.data(), id1h.size()*sizeof(int64_t));
+    upload(ks1, ks1h.data(), ks1h.size()*sizeof(int32_t));
+    upload(kp1, kp1h.data(), kp1h.size()*sizeof(int32_t));
+    if (backend) ggml_backend_graph_compute(backend, g1);
+    else         ggml_graph_compute_with_ctx(ctx, g1, n_threads);
+
+    // drop the staging: group 0 is now a committed/sealed pool (gid[0..31]==0), no open group.
+    smk0 = 0;
+    upload(smk, &smk0, sizeof(int32_t));
+    // group_index is host-managed (the CUDA write kernel never writes it; the host's
+    // kpc_rebuild_group_index does). After pass 1, group 0's 32 cells map to pool 0; the rest are free.
+    // The CPU kernel happens to leave the same gid, but set it explicitly so both backends agree.
+    {
+        std::vector<int32_t> gih(kv, -1);
+        for (int64_t cell = 0; cell < G; ++cell) gih[cell] = 0;   // sealed group 0 -> pool 0
+        upload(gi, gih.data(), kv*sizeof(int32_t));
+    }
+    // host survivor fill (mirrors llama_kv_cache::kpc_rebuild_group_index): all cells with gid==pool 0,
+    // -1 terminated. The kernel drops the ones that are members of this write (cells 0..n_new-1).
+    {
+        std::vector<int32_t> gih(kv);
+        if (backend) ggml_backend_tensor_get(gi, gih.data(), 0, kv*sizeof(int32_t));
+        else memcpy(gih.data(), gi->data, kv*sizeof(int32_t));
+        int32_t surv[KPC_GROUP];
+        int n = 0;
+        if (!empty_surv) {
+            for (int64_t cell = 0; cell < kv && n < KPC_GROUP; ++cell) {
+                if (gih[cell] == 0) surv[n++] = (int32_t) cell;   // pool 0
+            }
+        }
+        int wn = n;
+        if (n < KPC_GROUP) { surv[n] = -1; wn = n + 1; }   // -1 terminator only when the row isn't full (host rule)
+        // write rows 1.. (offset 1 within the single staging column)
+        if (backend) ggml_backend_tensor_set(sgp, surv, (size_t) 1*sizeof(int32_t), (size_t) wn*sizeof(int32_t));
+        else memcpy((int32_t *) sgp->data + 1, surv, (size_t) wn*sizeof(int32_t));
+        // row 0 (open group) is irrelevant now (smk==0 -> omask 0); leave it at 0
+    }
+
+    // pass 2: re-encode pool 0 with the few near-0 members; survivors must be rescued
+    upload(kc2, kc2h.data(), kc2h.size()*sizeof(float));
+    upload(id2, id2h.data(), id2h.size()*sizeof(int64_t));
+    upload(ks2, ks2h.data(), ks2h.size()*sizeof(int32_t));
+    upload(kp2, kp2h.data(), kp2h.size()*sizeof(int32_t));
+    if (backend) ggml_backend_graph_compute(backend, g2);
+    else         ggml_graph_compute_with_ctx(ctx, g2, n_threads);
+
+    // read back the packed cache + slab and dequant the whole group
+    std::vector<uint8_t> kb(ggml_nbytes(k)), szb(ggml_nelements(sz));
+    if (backend) { ggml_backend_tensor_get(k, kb.data(), 0, ggml_nbytes(k)); ggml_backend_tensor_get(sz, szb.data(), 0, ggml_nbytes(sz)); }
+    else { memcpy(kb.data(), k->data, ggml_nbytes(k)); memcpy(szb.data(), sz->data, ggml_nbytes(sz)); }
+
+    if (buf) ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    std::vector<float> deq;
+    dequant_cache(C, G, kb, szb, n_threads, deq);
+
+    // NMSE of the SURVIVOR cells (n_new..31) vs their ORIGINAL large values
+    double se = 0.0, sref = 0.0;
+    for (int64_t t = n_new; t < G; ++t) {
+        for (int64_t c = 0; c < C; ++c) {
+            const float orig = src_val_big(c, t);
+            const float e    = orig - deq[t*C + c];
+            se += (double) e*e; sref += (double) orig*orig;
+        }
+    }
+    const double nmse = se / (sref > 0.0 ? sref : 1.0);
+    *nmse_out = nmse;
+    return (nmse < 0.02) ? 0 : 1;
+}
+
+// strong survivor-rescue, run on the CPU op and (if present) the CUDA op; CPU is the reference.
+static int test_rescue_survivors(int n_threads) {
+    double nmse_cpu = 0.0;
+    const int rc_cpu = run_rescue_survivors(NULL, n_threads, /*empty_surv=*/false, &nmse_cpu);
+    if (rc_cpu != 0) {
+        printf("FAIL rescue-survivors-cpu: survivor NMSE=%.5f (rescue failed)\n", nmse_cpu);
+        return 1;
+    }
+    printf("PASS rescue-survivors-cpu: survivors rescued on pool re-encode (NMSE=%.5f)\n", nmse_cpu);
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (dev == NULL) {
+        printf("SKIP rescue-survivors-cuda: no GPU backend\n");
+        return 0;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (backend == NULL) {
+        printf("SKIP rescue-survivors-cuda: GPU backend init failed\n");
+        return 0;
+    }
+    double nmse_cuda = 0.0;
+    const int rc_cuda = run_rescue_survivors(backend, n_threads, /*empty_surv=*/false, &nmse_cuda);
+    // negative control: with an empty survivor list the CUDA rescue has nothing to fold, so the large
+    // survivor values decode against the members-only slab and must blow up. This proves the test actually
+    // exercises the rescue (guards against a vacuous pass if the rescue ever silently regresses).
+    double nmse_off = 0.0;
+    run_rescue_survivors(backend, n_threads, /*empty_surv=*/true, &nmse_off);
+    ggml_backend_free(backend);
+    if (rc_cuda != 0 || nmse_cuda > 1.5*nmse_cpu + 1e-4) {
+        printf("FAIL rescue-survivors-cuda: NMSE=%.5f vs cpu %.5f\n", nmse_cuda, nmse_cpu);
+        return 1;
+    }
+    if (nmse_off < 0.1) {
+        printf("FAIL rescue-survivors-cuda: rescue-off control NMSE=%.5f too low -- test not exercising the rescue\n", nmse_off);
+        return 1;
+    }
+    printf("PASS rescue-survivors-cuda: survivors rescued via staged_group list (NMSE=%.5f vs cpu %.5f; rescue-off control=%.4f)\n",
+           nmse_cuda, nmse_cpu, nmse_off);
+    return 0;
+}
+
 // GQA grouping invariance: grouped (nth=1) and ungrouped (nth=4) sibling-head walks must be
 // bit-identical (grouping only shares the K/V/mask walk, per-head math order is unchanged)
 static int test_attn_gqa_grouping(void) {
@@ -1062,7 +1391,7 @@ static int test_attn_gqa_grouping(void) {
         int32_t * gxd = (int32_t *) gx->data;
         for (int64_t i = 0; i < NKV; ++i) gxd[i] = (int32_t)(i / KPC_GROUP);
 
-        struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, szt, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f);
+        struct ggml_tensor * o = ggml_kpc_attn(ctx, qt, pk, szt, vt, mk, gx, NULL, 1.0f, 0.0f, 0.0f, 1);
         struct ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, o);
         ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -1156,6 +1485,11 @@ int main() {
     failures += test_attn_extras(nt,  8.0f, true,  0.0f, "softcap+sinks");
     failures += test_attn_extras(nt,  0.0f, false, 8.0f, "alibi");
 
+    // 5b. GPU-only: the runtime-dim decode kernel<0,0> (head_dim not in {64,128,256}, or DK != DV).
+    //     head_dim must be a multiple of 32 (KPC4_1 block size); 96 is the smallest such dim outside the set.
+    failures += test_attn_cuda_dims(nt,  96, 96, "hd96");
+    failures += test_attn_cuda_dims(nt, 128, 64, "dk-ne-dv");
+
     // 6. scatter-write: scattered physical slots decode == contiguous
     failures += test_scatter(nt);
 
@@ -1176,6 +1510,10 @@ int main() {
 
     // 12. pool re-encode rescue: continuing a group after its staging was dropped keeps the prior members
     failures += test_rescue(nt);
+
+    // 13. strong survivor-rescue: re-encode a sealed group's pool with a few foreign-range members;
+    //     committed survivors handed to the kernel via staged_group rows 1.. must decode near originals
+    failures += test_rescue_survivors(nt);
 
     // 14. GQA grouping: grouped sibling-head walk is bit-identical to per-head execution
     failures += test_attn_gqa_grouping();

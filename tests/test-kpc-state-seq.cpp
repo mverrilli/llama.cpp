@@ -2,7 +2,6 @@
 // restore it into another context, and require seq-1 next-token logits to match the no-restore baseline.
 // Covers, via env vars, the configs that gate server adoption:
 //   KPC_SEQ_RAW=1          -> Stage 2 RAW fast path (int4+scalezp verbatim, bit-exact on aligned restore)
-//   KPC_STAGING_SLOTS=1    -> virtualized staging (slot < n_seq_max)
 //   KPC_TEST_NONUNIFIED=1  -> non-unified cache (each sequence its own stream)
 // Two restore targets are checked: a FRESH context, and a LIVE context where seq 0 is already decoded (so seq 1
 // lands in non-empty, non-32-aligned cells and must not collide with seq 0).
@@ -57,7 +56,15 @@ int main(int argc, char ** argv) {
     params.sampling.seed = 1234;
     params.kv_unified     = !nonunified;   // unified (shared stream, banded pools) vs non-unified (per-seq streams)
     params.n_parallel     = 2;             // n_seq_max = 2
-    params.n_ctx          = 256;
+    // P>=~2100 makes each seq's decode attend n_kv>=2048 -> fires the grid-level split-K (kv_split) so the determinism
+    // gate's kv_split coverage is actually exercised (the default P=40 only hits the in-block n_split).
+    const int   P_cfg     = getenv("KPC_TEST_P") ? atoi(getenv("KPC_TEST_P")) : 40;
+    params.n_ctx          = (P_cfg > 100) ? (uint32_t) (4 * (P_cfg + 64)) : 256;   // room for 2 seqs + the new token
+    {   // the interleaved prompt is one batch of 2*P tokens -> n_batch/n_ubatch must hold it
+        const uint32_t nb = (uint32_t) (2 * (P_cfg + 8));
+        if (nb > params.n_batch)  { params.n_batch  = nb; }
+        if (nb > params.n_ubatch) { params.n_ubatch = nb; }
+    }
     common_init_result_ptr init = kpc_model_init(argc, argv, params, __func__);
     if (!init || init->model() == nullptr) {
         return 1;
@@ -71,12 +78,11 @@ int main(int argc, char ** argv) {
     const int           n_vocab = llama_vocab_n_tokens(vocab);
     const auto          cparams = common_context_params_to_llama(params);
 
-    const int         P   = 40;   // leaves seq 1 mid-group (open members 32..39) -> exercises the staging tail
+    const int         P   = P_cfg;   // default 40 (mid-group staging tail); KPC_TEST_P>=2100 fires grid-split kv_split
     const llama_token tok = 1;
 
-    fprintf(stderr, "%s: config raw=%s staging=%s %s\n", __func__,
+    fprintf(stderr, "%s: config raw=%s %s\n", __func__,
             getenv("KPC_SEQ_RAW") ? getenv("KPC_SEQ_RAW") : "0",
-            getenv("KPC_STAGING_SLOTS") ? getenv("KPC_STAGING_SLOTS") : "(default)",
             nonunified ? "NON-UNIFIED" : "unified");
 
     std::vector<uint8_t> seqstate;

@@ -2119,11 +2119,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         if (k->type == GGML_TYPE_KPC4_1 && k_scalezp) {
-            // fused per-channel attention: reads 4-bit K directly (alibi/softcap/sinks in-kernel);
-            // kq_scale folds into the kernel's Q prescale, so q needs no separate cont+scale pass
+            // fused decode: reads 4-bit K directly, kq_scale folds into the kernel's Q prescale
             cur = ggml_kpc_attn(ctx0, q, k, k_scalezp, v, kq_mask, k_groupidx,
                                 sinks, kq_scale, hparams.f_max_alibi_bias,
-                                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                                (int32_t) cparams.n_seq_max);
             cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
         } else {
             GGML_ASSERT(k->type != GGML_TYPE_KPC4_1 && "kpc4_1 K-cache: MLA/DSA attention not supported");

@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/kpc.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -3085,6 +3086,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_KPC_FLASH_ATTN:
+            ggml_cuda_kpc_flash_attn(ctx, dst);
+            break;
+        case GGML_OP_KPC_WRITE:
+            ggml_cuda_kpc_write(ctx, dst);
+            break;
+        case GGML_OP_KPC_DEQUANT:
+            ggml_cuda_kpc_dequant(ctx, dst);
+            break;
+        case GGML_OP_KPC_REQUANT:
+            ggml_cuda_kpc_requant(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -5439,6 +5452,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_KPC_FLASH_ATTN:
+        case GGML_OP_KPC_WRITE:
+        case GGML_OP_KPC_DEQUANT:
+        case GGML_OP_KPC_REQUANT:
+            return ggml_cuda_kpc_supported(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
