@@ -285,6 +285,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-kpc-state-seq-nonunified PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_TEST_NONUNIFIED=1")
     add_test(NAME test-kpc-state-seq-nonunified-raw COMMAND test-kpc-state-seq -m "${KPC_MODEL}")
     set_tests_properties(test-kpc-state-seq-nonunified-raw PROPERTIES FIXTURES_REQUIRED kpc-model ENVIRONMENT "KPC_TEST_NONUNIFIED=1;KPC_SEQ_RAW=1")
+
+    # END-TO-END survivor-rescue: real llama_memory_seq_rm + continue drives set_input_kpc's survivor fill.
+    # CPU run (no -ngl) and a CUDA run (-ngl 99, the only way the GPU rescue path runs; falls back to CPU if no GPU).
+    llama_build_and_test(test-kpc-seq-rm.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-seq-rm PROPERTIES FIXTURES_REQUIRED kpc-model)
+    add_test(NAME test-kpc-seq-rm-cuda COMMAND test-kpc-seq-rm -m "${KPC_MODEL}" -ngl 99)
+    set_tests_properties(test-kpc-seq-rm-cuda PROPERTIES FIXTURES_REQUIRED kpc-model)
 endif()
 
 if (NOT GGML_BACKEND_DL)
