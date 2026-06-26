@@ -19,8 +19,14 @@ static inline int unsetenv(const char * name) { return _putenv_s(name, ""); }
 // init model+context with the kpc4_1/q4_1 cache from argv (caller pre-fills params). returns null on
 // parse fail; caller checks model() (bail) and context() (skip: incompatible head_dim)
 static inline common_init_result_ptr kpc_model_init(int argc, char ** argv, common_params & params, const char * who) {
-    params.cache_type_k    = GGML_TYPE_KPC4_1;
-    params.cache_type_v    = GGML_TYPE_Q4_1;                 // KPC pairs kpc4_1 K with q4_1 V
+    // KPC_FORCE_F16=1 swaps in an f16 KV cache (control: isolates kpc-specific behavior from the test harness).
+    if (getenv("KPC_FORCE_F16")) {
+        params.cache_type_k = GGML_TYPE_F16;
+        params.cache_type_v = GGML_TYPE_F16;
+    } else {
+        params.cache_type_k = GGML_TYPE_KPC4_1;
+        params.cache_type_v = GGML_TYPE_Q4_1;               // KPC pairs kpc4_1 K with q4_1 V
+    }
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;  // KPC fused attention is a flash-attn op
 
     common_init();

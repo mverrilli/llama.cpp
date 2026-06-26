@@ -292,6 +292,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-kpc-seq-rm PROPERTIES FIXTURES_REQUIRED kpc-model)
     add_test(NAME test-kpc-seq-rm-cuda COMMAND test-kpc-seq-rm -m "${KPC_MODEL}" -ngl 99)
     set_tests_properties(test-kpc-seq-rm-cuda PROPERTIES FIXTURES_REQUIRED kpc-model)
+
+    # SPEC-DECODE access pattern: repeated multi-token write + partial seq_rm rollback of the open group.
+    llama_build_and_test(test-kpc-specdecode.cpp LABEL "model" ARGS -m "${KPC_MODEL}")
+    set_tests_properties(test-kpc-specdecode PROPERTIES FIXTURES_REQUIRED kpc-model)
+    add_test(NAME test-kpc-specdecode-cuda COMMAND test-kpc-specdecode -m "${KPC_MODEL}" -ngl 99)
+    set_tests_properties(test-kpc-specdecode-cuda PROPERTIES FIXTURES_REQUIRED kpc-model)
 endif()
 
 if (NOT GGML_BACKEND_DL)

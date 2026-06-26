@@ -1756,14 +1756,38 @@ void llama_kv_cache::set_input_kpc(ggml_tensor * seq, ggml_tensor * pos, const l
         const uint32_t band_size = (uint32_t) layers[0].k_scalezp->ne[1] / n_seqps;
         const int32_t  SG        = 1 + KPC_GROUP;                          // staged_group column stride (= ne[0])
         const int32_t * gi       = (const int32_t *) layers[0].group_index->data;
+
+        // Per-seq open group = the LOWEST logical group written this ubatch (the group being extended, which may
+        // hold prior committed cells that this write's seal must rescue). We key the survivor gather off this
+        // rather than the device-owned staged_group row 0: a rejected speculative-draft batch that spilled into the
+        // next group seals the lower group as "complete" and moves row 0 to the (then seq_rm-emptied) upper group,
+        // while real writes keep landing in the lower group. Its committed cells then end up neither staged (omask)
+        // nor gathered here -> silently re-quantized against a members-only slab (catastrophic; spec-decode). The
+        // minimum written position can never be a to-be-rejected draft tail, so it is rejection-proof. omask still
+        // keys off staged_group row 0 in-kernel; only this survivor-rescue list changes. seqs not written this
+        // ubatch keep the prior staged_group/mask scan.
+        std::vector<int32_t> open_grp(n_seq_max, -1);
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                const uint32_t     ti = s*sinfo.size() + i;
+                const llama_seq_id sb = ubatch->seq_id[ti][0];
+                const int32_t      g  = pos_data[ti] / KPC_GROUP;
+                if (open_grp[sb] < 0 || g < open_grp[sb]) open_grp[sb] = g;
+            }
+        }
+
         int32_t surv[KPC_GROUP];                                           // <= KPC_GROUP-1 cell indices + the -1 terminator
         for (uint32_t slot = 0; slot < n_seq_max; ++slot) {
-            int32_t mask = 0;
-            ggml_backend_tensor_get(layers[0].staged_mask, &mask, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
+            int32_t g = open_grp[slot];                                    // open group from this ubatch's min position
+            if (g < 0) {                                                   // seq not written this ubatch: prior behavior
+                int32_t mask = 0;
+                ggml_backend_tensor_get(layers[0].staged_mask, &mask, (size_t) slot*sizeof(int32_t), sizeof(int32_t));
+                if (mask != 0) {
+                    ggml_backend_tensor_get(layers[0].staged_group, &g, (size_t) slot*SG*sizeof(int32_t), sizeof(int32_t)); // row 0
+                }
+            }
             int n = 0;
-            if (mask != 0) {
-                int32_t g = 0;
-                ggml_backend_tensor_get(layers[0].staged_group, &g, (size_t) slot*SG*sizeof(int32_t), sizeof(int32_t)); // row 0
+            if (g >= 0) {
                 const int32_t  pool = (int32_t)((slot % n_seqps)*band_size + ((uint32_t) g % band_size));
                 const uint32_t s    = slot / n_seqps;                      // physical stream
                 for (uint32_t cell = 0; cell < kvs && n < KPC_GROUP; ++cell) {   // cap KPC_GROUP: a re-targeted sealed
